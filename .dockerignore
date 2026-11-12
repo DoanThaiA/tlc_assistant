@@ -1,0 +1,14 @@
+.venv
+.git
+**/__pycache__
+*.pyc
+.env
+data
+*.db
+*.db-wal
+*.db-shm
+tests
+apps-script
+backups
+nginx
+deploy.sh

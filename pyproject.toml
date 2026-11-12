@@ -1,0 +1,23 @@
+[project]
+name = "email-report-mcp"
+version = "0.1.0"
+description = "MCP server (FastMCP, HTTP) luu tru va hoi dap email bao cao ngay cua nhan vien"
+readme = "README.md"
+authors = [
+    { name = "lucyaisim-ship-it", email = "lucy.ai.sim@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "fastmcp>=4.1.8",
+    "python-dotenv>=1.2.4",
+    "tzdata>=2026.6",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+email-report-mcp = "email_report_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"

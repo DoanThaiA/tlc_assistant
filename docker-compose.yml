@@ -1,0 +1,62 @@
+services:
+  app:
+    build: .
+    image: email-report-mcp:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Cố định cho môi trường container, ghi đè giá trị trong .env
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      DB_PATH: /app/data/reports.db
+      MCP_ALLOWED_HOSTS: ${DOMAIN:?Cần đặt DOMAIN trong .env}
+    volumes:
+      - reports-data:/app/data
+    ports:
+      # Chỉ mở cho chính máy chủ (để kiểm tra / dùng nginx cài sẵn trên host). Bên ngoài đi qua nginx.
+      - "127.0.0.1:8000:8000"
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:1.28.0-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - certbot-etc:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+    # Nạp lại cấu hình mỗi 6 giờ để nhận chứng chỉ đã gia hạn
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "(while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'"
+    logging: *logging
+
+  certbot:
+    image: certbot/certbot:v4.0.0
+    restart: unless-stopped
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    # Kiểm tra gia hạn chứng chỉ mỗi 12 giờ (chỉ gia hạn khi còn < 30 ngày)
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"
+    logging: *logging
+
+volumes:
+  reports-data:    # CSDL báo cáo — cần sao lưu
+  certbot-etc:     # chứng chỉ HTTPS
+  certbot-www:

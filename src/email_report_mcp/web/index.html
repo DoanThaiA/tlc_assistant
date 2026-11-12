@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Quản lý email công việc</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d4ed8'/%3E%3Cpath d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <!-- Màn hình đăng nhập -->
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <div class="brand brand-lg"><span class="logo"></span>Email công việc</div>
+      <p class="muted" id="login-hint">Đăng nhập để quản lý dữ liệu.</p>
+      <label>Mật khẩu
+        <input type="password" name="password" autocomplete="current-password" required autofocus>
+      </label>
+      <p class="error" id="login-error" hidden></p>
+      <button class="btn primary block" type="submit">Đăng nhập</button>
+    </form>
+  </main>
+
+  <!-- Ứng dụng -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand"><span class="logo"></span>Email công việc</div>
+      <nav class="tabs" id="tabs">
+        <a href="#/overview" data-view="overview">Tổng quan</a>
+        <a href="#/pending" data-view="pending">Chờ duyệt <span class="count" id="pending-count" hidden></span></a>
+        <a href="#/reports" data-view="reports">Email đã lưu</a>
+        <a href="#/employees" data-view="employees">Nhân viên</a>
+        <a href="#/rules" data-view="rules">Quy tắc lọc</a>
+        <a href="#/imports" data-view="imports">Nhật ký nhập</a>
+      </nav>
+      <button class="btn ghost sm" id="logout" type="button">Đăng xuất</button>
+    </header>
+    <main class="content" id="view"></main>
+  </div>
+
+  <dialog id="modal"><div id="modal-body"></div></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
