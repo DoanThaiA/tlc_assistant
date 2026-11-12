@@ -65,6 +65,79 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+
+-- ===== ZALO: hội thoại theo dõi, công việc được giao, nhật ký trả lời (xem zalo.py) =====
+CREATE TABLE IF NOT EXISTS zalo_conversations (
+    id                    INTEGER PRIMARY KEY,
+    name                  TEXT NOT NULL UNIQUE,     -- tên nhóm / người đúng như hiển thị trên Zalo
+    name_norm             TEXT NOT NULL UNIQUE,     -- tên không dấu, để tra cứu
+    kind                  TEXT NOT NULL DEFAULT 'direct',   -- group | direct | self
+    watch                 INTEGER NOT NULL DEFAULT 1,       -- 1 = quét hội thoại này
+    auto_reply            INTEGER NOT NULL DEFAULT 0,       -- 1 = được tự trả lời
+    note                  TEXT,                     -- người này là ai, cách xưng hô...
+    last_message_key      TEXT,                     -- mốc tin cuối đã xử lý
+    last_message_at       TEXT,
+    last_message_preview  TEXT,
+    last_scanned_at       TEXT,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id                  INTEGER PRIMARY KEY,
+    conversation_id     INTEGER REFERENCES zalo_conversations(id) ON DELETE SET NULL,
+    msg_key             TEXT UNIQUE,                -- mã tin giao việc (chống lưu trùng)
+    source              TEXT NOT NULL DEFAULT 'zalo',
+    assigner            TEXT,                       -- người giao
+    title               TEXT NOT NULL,              -- tóm tắt ngắn
+    content             TEXT,                       -- nguyên văn tin giao việc
+    kind                TEXT NOT NULL DEFAULT 'info',     -- info (Claude tự trả lời) | action (người làm, Claude nhắc)
+    priority            TEXT NOT NULL DEFAULT 'binh_thuong',
+    status              TEXT NOT NULL DEFAULT 'open',     -- open | waiting | done | cancelled
+    assigned_at         TEXT,
+    due_at              TEXT,                       -- ISO 8601 theo múi giờ cấu hình
+    due_text            TEXT,                       -- nguyên văn hạn: "trước 5h chiều mai"
+    lead_minutes        INTEGER NOT NULL DEFAULT 30,
+    fire_at             TEXT,                       -- thời điểm xử lý = due_at - lead_minutes
+    fired_at            TEXT,                       -- đã xử lý (trả lời / nhắc) lúc nào
+    replied_at          TEXT,
+    done_at             TEXT,
+    result              TEXT,                       -- kết quả / câu trả lời đã gửi
+    related_report_ids  TEXT,                       -- JSON [id email liên quan]
+    tags                TEXT,                       -- ",tag-1,tag-2,"
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_fire ON tasks(status, fire_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_conv ON tasks(conversation_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    title, content, assigner, tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    id       INTEGER PRIMARY KEY,
+    task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    at       TEXT NOT NULL,
+    type     TEXT NOT NULL,     -- created | updated | reminded | replied | done | cancelled | note
+    detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id);
+
+CREATE TABLE IF NOT EXISTS zalo_actions (
+    id                 INTEGER PRIMARY KEY,
+    conversation_id    INTEGER REFERENCES zalo_conversations(id) ON DELETE SET NULL,
+    msg_key            TEXT NOT NULL UNIQUE,        -- chống trả lời 2 lần cùng một tin
+    sender             TEXT,
+    message_at         TEXT,
+    message_text       TEXT,                        -- tin gốc (cắt 500 ký tự)
+    action             TEXT NOT NULL,               -- answered | task_saved | task_reply | reminder
+    reply_text         TEXT,
+    task_id            INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    source_report_ids  TEXT,                        -- JSON [id email đã dùng làm nguồn]
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zalo_actions_conv ON zalo_actions(conversation_id, created_at);
 """
 
 # Cột thêm sau (tự migrate CSDL cũ). Email cũ mặc định "kept".
