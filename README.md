@@ -126,10 +126,21 @@ Nên đặt lịch sao lưu hằng ngày, ví dụ `crontab -e` rồi thêm dòn
 0 23 * * * cd /opt/email-report-mcp && bash deploy.sh backup >/dev/null 2>&1
 ```
 
-**Nếu VPS đã có Nginx chạy sẵn trên host** (đang dùng cổng 80/443 cho web khác): chỉ chạy container app bằng `docker compose up -d --build app`.
-App lắng nghe ở `127.0.0.1:8000`. Thêm site vào nginx của host, dùng khối `location /` trong
-[nginx/templates/default.conf.template](nginx/templates/default.conf.template) nhưng đổi `proxy_pass` thành
-`http://127.0.0.1:8000`. Sau đó xin chứng chỉ bằng `certbot --nginx -d mcp.congty.vn`.
+**Nếu VPS đã có Nginx chạy sẵn trên host** (đang dùng cổng 80/443 cho web khác) — triển khai qua GitHub:
+
+```bash
+git clone https://github.com/DoanThaiA/tlc_assistant.git /opt/tlc_assistant && cd /opt/tlc_assistant
+```
+
+```bash
+bash deploy.sh app
+```
+
+Lệnh trên hỏi domain, tự sinh API key + mật khẩu quản trị, chạy app ở `127.0.0.1:8000` (không đụng cổng 80/443).
+Sau đó gắn site vào nginx của host bằng [nginx/host-tlc.mcv.network.conf](nginx/host-tlc.mcv.network.conf)
+(đổi `server_name` nếu dùng domain khác) và xin chứng chỉ bằng `certbot --nginx -d <domain>`.
+
+Cập nhật code về sau: push lên GitHub, rồi trên VPS chạy `bash deploy.sh update` (git pull + build lại app, giữ dữ liệu).
 
 ## Trang quản trị dữ liệu (giao diện web)
 

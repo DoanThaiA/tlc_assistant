@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Cài đặt / cập nhật Email Report MCP trên VPS bằng Docker Compose + Nginx + Let's Encrypt.
 #
-#   bash deploy.sh            cài lần đầu hoặc cập nhật sau khi chép code mới
+#   bash deploy.sh            cài đầy đủ (app + nginx + certbot trong Docker) — VPS chưa có web server
+#   bash deploy.sh app        chỉ chạy app ở 127.0.0.1:8000 — VPS ĐÃ CÓ nginx trên host
+#   bash deploy.sh update     git pull + build lại (giữ đúng chế độ đã cài)
 #   bash deploy.sh status     xem trạng thái, URL kết nối
 #   bash deploy.sh logs       xem log của app
 #   bash deploy.sh backup     sao lưu CSDL ra thư mục backups/
@@ -151,11 +153,65 @@ cmd_deploy() {
   print_info
 }
 
+# Chỉ chạy container app (VPS đã có nginx trên host lo HTTPS, xem nginx/host-*.conf)
+cmd_app() {
+  require_docker
+  if [ ! -f .env ]; then cp .env.example .env; say "Đã tạo .env từ .env.example"; fi
+  sed -i 's/\r$//' .env
+
+  local domain
+  domain=$(get_env DOMAIN)
+  if [ -z "$domain" ] || [ "$domain" = "mcp.congty.vn" ]; then
+    read -rp "Domain của MCP server (vd tlc.mcv.network): " domain
+    [ -n "$domain" ] || die "Cần domain."
+    set_env DOMAIN "$domain"
+  fi
+  if [ -z "$(get_env MCP_API_KEYS)" ]; then
+    set_env MCP_API_KEYS "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+    say "Đã sinh API key mới"
+  fi
+  if [ -z "$(get_env ADMIN_PASSWORD)" ]; then
+    set_env ADMIN_PASSWORD "$(openssl rand -base64 18 | tr '+/' '-_' | tr -d '=\n')"
+    say "Đã sinh mật khẩu trang quản trị (ADMIN_PASSWORD)"
+  fi
+  set_env DEPLOY_MODE app
+  chmod 600 .env
+
+  say "Build & chạy app..."
+  docker compose build --pull app
+  docker compose up -d --no-deps app
+
+  local ok=""
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then ok=1; break; fi
+    sleep 2
+  done
+  [ -n "$ok" ] && say "App chạy ở http://127.0.0.1:8000" || warn "App chưa phản hồi — xem: docker compose logs app"
+  if curl -fsS --max-time 10 "https://${domain}/health" >/dev/null 2>&1; then
+    say "Hoạt động: https://${domain}/health"
+  else
+    warn "Chưa gọi được https://${domain}/health — cần cấu hình nginx trên host + certbot (xem README)."
+  fi
+  docker image prune -f >/dev/null 2>&1 || true
+  print_info
+}
+
+# Lấy code mới từ GitHub rồi build lại theo đúng chế độ đã cài
+cmd_update() {
+  require_docker
+  [ -d .git ] || die "Thư mục này không phải git clone. Dùng: git clone <repo> rồi chạy lại."
+  say "git pull..."
+  git pull --ff-only || die "git pull lỗi (có sửa file trực tiếp trên VPS?). Xem: git status"
+  if [ "$(get_env DEPLOY_MODE)" = "app" ]; then cmd_app; else cmd_deploy; fi
+}
+
 case "${1:-deploy}" in
   deploy)  cmd_deploy ;;
+  app)     cmd_app ;;
+  update)  cmd_update ;;
   status)  require_docker; cmd_status ;;
   logs)    require_docker; docker compose logs -f --tail=200 app ;;
   backup)  require_docker; cmd_backup ;;
   restore) require_docker; cmd_restore "${2:-}" ;;
-  *) die "Lệnh không hợp lệ: $1 (deploy | status | logs | backup | restore <file>)" ;;
+  *) die "Lệnh không hợp lệ: $1 (deploy | app | update | status | logs | backup | restore <file>)" ;;
 esac
