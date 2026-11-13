@@ -114,7 +114,7 @@ async def run_tests() -> None:
 
         cp = await call(c, "start_cycle")
         assert cp["email"]["latest_sent_at"] == "2026-11-11T17:30:00+07:00" and cp["email"]["pending"] == 0, cp
-        assert cp["warnings"] and not cp["ceo_conversations"], cp
+        assert cp["warnings"] and not cp["reply_conversations"], cp
         print("✓ start_cycle:", cp["email"]["latest_sent_at"], "| không có email chờ lọc")
 
         s = await call(c, "search_reports", query="da nang hop dong")

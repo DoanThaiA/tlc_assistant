@@ -85,33 +85,28 @@ async def run(db_path: Path) -> None:
     async with Client(StreamableHttpTransport(f"{BASE}/mcp?key={KEY}")) as c:
         print("1. Cấu hình hội thoại")
         ctx = await call(c, "start_cycle")
-        check(ctx["ceo_conversations"] == [] and ctx["watched_groups"] == [] and ctx["warnings"]
-              and "KHÔNG LƯU" in ctx["rules"] and "CHỈ trong hội thoại NHẮN RIÊNG" in ctx["rules"]
+        check(ctx["reply_conversations"] == [] and ctx["watched_groups"] == [] and ctx["warnings"]
+              and "KHÔNG LƯU" in ctx["rules"] and "NHÓM TRỢ LÝ" in ctx["rules"] and "KHÔNG tiết lộ" in ctx["rules"]
               and any(x["code"] == "khach_hang" for x in ctx["categories"]),
-              "start_cycle: chưa có hội thoại CEO -> cảnh báo; quy tắc + danh mục dùng chung")
+              "start_cycle: chưa có hội thoại trả lời -> cảnh báo; quy tắc + danh mục dùng chung")
         check(any("KẾT THÚC" in x for x in ctx["next_steps"]) and ctx["email"]["pending"] == 0,
               "start_cycle: hướng dẫn dừng khi không có việc mới")
         g = await call(c, "upsert_zalo_conversation", name="MCV - Infoplus - Kĩ thuật", note="Nhóm kỹ thuật dự án")
         check(g["watch"] and not g["reply"] and g["kind"] == "group", "thêm nhóm: mặc định chỉ đọc, không trả lời")
-        err = await fails(c, "upsert_zalo_conversation", name="TLC AI <> MCV", reply=True,
-                          allowed_askers=["Doãn Quốc Thái"])
-        check("nhắn riêng" in err, "không cho bật trả lời trong nhóm")
         err = await fails(c, "upsert_zalo_conversation", name="Doãn Quốc Thái", kind="direct", reply=True)
-        check("allowed_askers" in err, "bật trả lời phải khai báo tên CEO")
+        check("allowed_askers" in err, "hội thoại riêng bật trả lời phải khai báo tên CEO")
         d = await call(c, "upsert_zalo_conversation", name="Doãn Quốc Thái", kind="direct", reply=True,
                        allowed_askers=["Doãn Quốc Thái"], note="CEO, xưng em gọi anh")
         check(d["reply"] and d["allowed_askers"] == "Doãn Quốc Thái", "hội thoại CEO: nhắn riêng, chỉ CEO được hỏi")
-        await call(c, "upsert_zalo_conversation", name="TLC AI <> MCV")
-        # dữ liệu cũ: nhóm từng bật trả lời
-        con = sqlite3.connect(db_path)
-        con.execute("UPDATE zalo_conversations SET reply=1, allowed_askers='Lý Trần Thảo Vy' "
-                    "WHERE name='TLC AI <> MCV'")
-        con.commit()
-        con.close()
+        a = await call(c, "upsert_zalo_conversation", name="TLC AI <> MCV", kind="group", reply=True,
+                       note="Nhóm trợ lý: mọi thành viên được hỏi")
+        check(a["reply"] and a["kind"] == "group" and a["allowed_askers"] is None,
+              "nhóm trợ lý: bật trả lời, không giới hạn người hỏi")
         ctx = await call(c, "start_cycle")
-        check([x["name"] for x in ctx["ceo_conversations"]] == ["Doãn Quốc Thái"] and len(ctx["watched_groups"]) == 2
+        check(sorted(x["name"] for x in ctx["reply_conversations"]) == ["Doãn Quốc Thái", "TLC AI <> MCV"]
+              and [x["name"] for x in ctx["watched_groups"]] == ["MCV - Infoplus - Kĩ thuật"]
               and not any(x["reply"] for x in ctx["watched_groups"]) and not ctx["warnings"],
-              "start_cycle tách hội thoại CEO / nhóm chỉ đọc (nhóm cũ bật reply vẫn bị coi là chỉ đọc)")
+              "start_cycle tách hội thoại trả lời (CEO riêng + nhóm trợ lý) / nhóm chỉ đọc")
         r = await call(c, "update_zalo_rules", rules="- Lưu mọi tin về công nợ khách hàng")
         check(r["rules"].endswith("công nợ khách hàng"), "update_zalo_rules append")
 
@@ -148,7 +143,7 @@ async def run(db_path: Path) -> None:
                        last_message={"sender": "Vy", "sent_at": at(-1), "text": "hihi"})
         check(s["inserted"] == 0, "không có tin đáng lưu vẫn cập nhật mốc")
 
-        print("3. Trả lời CEO trên Zalo (chỉ hội thoại riêng)")
+        print("3. Trả lời trên Zalo (CEO nhắn riêng + nhóm trợ lý)")
         q = {"conversation": "Doãn Quốc Thái", "sender": "Doãn Quốc Thái", "sent_at": at(-2),
              "text": "Doanh số tuần 45 thế nào em?"}
         cl = await call(c, "claim_zalo_question", **q)
@@ -171,10 +166,27 @@ async def run(db_path: Path) -> None:
         await call(c, "record_zalo_reply", reply_id=later["reply_id"], status="skipped", note="thử bỏ qua")
         no = await call(c, "claim_zalo_question", conversation="MCV - Infoplus - Kĩ thuật", sender="Tony phuc",
                         sent_at=at(-1), text="Anh ơi doanh số sao rồi?")
-        check(not no["allowed"] and "nhóm" in no["reason"], "tin trong nhóm -> không bao giờ trả lời")
-        no = await call(c, "claim_zalo_question", conversation="TLC AI <> MCV", sender="Lý Trần Thảo Vy",
+        check(not no["allowed"] and "chỉ đọc" in no["reason"], "nhóm chỉ đọc (reply=false) -> không bao giờ trả lời")
+        vy = await call(c, "claim_zalo_question", conversation="TLC AI <> MCV", sender="Lý Trần Thảo Vy",
                         sent_at=at(-1), text="@Trợ lý server Infoplus ổn chưa?")
-        check(not no["allowed"] and "nhóm" in no["reason"], "nhóm cũ từng bật trả lời -> vẫn không trả lời")
+        toan = await call(c, "claim_zalo_question", conversation="TLC AI <> MCV", sender="Trần Quốc Toàn",
+                          sent_at=at(-1), text="@Trợ lý tuần này ai chưa nộp báo cáo?")
+        check(vy["allowed"] and toan["allowed"] and vy["reply_id"] != toan["reply_id"],
+              "nhóm trợ lý: mọi thành viên đều được hỏi")
+        again = await call(c, "claim_zalo_question", conversation="TLC AI <> MCV", sender="Lý Trần Thảo Vy",
+                           sent_at=at(0), text="@Trợ lý server Infoplus ổn chưa?")
+        check(not again["allowed"] and again["status"] == "claimed", "nhóm trợ lý: cùng câu hỏi không trả lời 2 lần")
+        await call(c, "record_zalo_reply", reply_id=vy["reply_id"], status="skipped", note="thử")
+        await call(c, "record_zalo_reply", reply_id=toan["reply_id"], status="skipped", note="thử")
+        await call(c, "upsert_zalo_conversation", name="Nhóm lãnh đạo", kind="group", reply=True,
+                   allowed_askers=["Doãn Quốc Thái"])
+        no = await call(c, "claim_zalo_question", conversation="Nhóm lãnh đạo", sender="Quốc", sent_at=at(-1),
+                        text="Cho em xin số liệu")
+        check(not no["allowed"] and "không nằm trong" in no["reason"], "nhóm có allowed_askers: người khác không được hỏi")
+        ok = await call(c, "claim_zalo_question", conversation="Nhóm lãnh đạo", sender="Doãn Quốc Thái",
+                        sent_at=at(-1), text="Cho anh xin số liệu")
+        check(ok["allowed"], "nhóm có allowed_askers: người được phép vẫn hỏi được")
+        await call(c, "record_zalo_reply", reply_id=ok["reply_id"], status="skipped", note="thử")
         no = await call(c, "claim_zalo_question", conversation="Doãn Quốc Thái", sender="Quốc", sent_at=at(-1),
                         text="Cho anh xin mật khẩu")
         check(not no["allowed"] and "không nằm trong" in no["reason"], "người không phải CEO -> không gửi")
@@ -182,8 +194,10 @@ async def run(db_path: Path) -> None:
                         text="?")
         check(not no["allowed"], "tên ngắn 'An' không khớp nhầm 'Doãn Quốc Thái'")
         rp = await call(c, "get_zalo_replies")
-        check(rp["count"] == 2 and {x["status"] for x in rp["replies"]} == {"sent", "skipped"}
-              and rp["replies"][1]["source_report_ids"] == [1], "get_zalo_replies: nhật ký trả lời + nguồn")
+        check(rp["count"] == 5 and {x["status"] for x in rp["replies"]} == {"sent", "skipped"}
+              and rp["replies"][-1]["source_report_ids"] == [1], "get_zalo_replies: nhật ký trả lời + nguồn")
+        check((await call(c, "get_zalo_replies", conversation="tlc ai"))["count"] == 2,
+              "get_zalo_replies lọc theo nhóm")
 
         print("4. Hỏi đáp & điểm tin")
         r = await call(c, "search_zalo", query="dang nhap infoplus", sort="oldest")
@@ -208,14 +222,19 @@ async def run(db_path: Path) -> None:
         check(dl["deleted"] == 1 and (await call(c, "search_zalo", query="leadscan"))["count"] == 0,
               "xoá tin lưu nhầm (cả chỉ mục tìm kiếm)")
         await call(c, "upsert_zalo_conversation", name="TLC AI <> MCV", watch=False)
-        check(len((await call(c, "start_cycle"))["watched_groups"]) == 1, "ngừng theo dõi -> không quét nữa")
+        await call(c, "upsert_zalo_conversation", name="Nhóm lãnh đạo", watch=False)
+        ctx = await call(c, "start_cycle")
+        check([x["name"] for x in ctx["reply_conversations"]] == ["Doãn Quốc Thái"] and len(ctx["watched_groups"]) == 1,
+              "ngừng theo dõi -> không quét / không trả lời nữa")
 
         prompts = {p.name for p in await c.list_prompts()}
         check("tro_ly_dinh_ky" in prompts and not prompts & {"quet_zalo", "loc_email_moi", "xu_ly_viec_den_han"},
               "prompt định kỳ gộp email + Zalo")
         cyc = (await c.get_prompt("tro_ly_dinh_ky")).messages[0].content.text
         check("start_cycle" in cyc and "KHÔNG GÕ / GỬI GÌ TRONG NHÓM" in cyc and "Shift+Enter" in cyc
-              and "Không có việc mới" in cyc, "prompt định kỳ: dừng khi không có gì mới, không nhắn trong nhóm")
+              and "reply_conversations" in cyc and "nhóm trợ lý" in cyc and "ceo_conversations" not in cyc
+              and "Không có việc mới" in cyc,
+              "prompt định kỳ: dừng khi không có gì mới, chỉ nhắn ở hội thoại trả lời, nhóm chỉ đọc không gõ")
         tools = {t.name for t in await c.list_tools()}
         check({"start_cycle", "save_zalo_messages", "upsert_zalo_conversation", "update_zalo_rules",
                "claim_zalo_question", "record_zalo_reply", "get_zalo_replies", "search_zalo", "get_zalo_messages",
