@@ -54,6 +54,12 @@ async def call(c: Client, tool: str, **args):
     return res.structured_content if res.structured_content is not None else res.data
 
 
+def api(method: str, path: str, body: dict | None = None) -> dict:
+    r = httpx.request(method, f"{BASE}{path}", json=body, headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
 def ingest(reports: list[dict]) -> dict:
     r = httpx.post(f"{BASE}/ingest", json={"source": "gmail", "reports": reports},
                    headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
@@ -67,8 +73,13 @@ async def run() -> None:
     check(r["inserted"] == 6 and all(x["review_status"] == "pending" for x in r["results"]), "6 email vào trạng thái chờ duyệt")
 
     async with Client(StreamableHttpTransport(f"{BASE}/mcp?key={KEY}")) as c:
-        await call(c, "upsert_employee", email="an.nguyen@congty.vn", name="Nguyễn Văn An", department="Kinh doanh")
-        await call(c, "upsert_employee", email="binh.tran@congty.vn", name="Trần Thị Bình", department="Kỹ thuật")
+        api("POST", "/api/employees", {"email": "an.nguyen@congty.vn", "name": "Nguyễn Văn An",
+                                       "department": "Kinh doanh"})
+        api("POST", "/api/employees", {"email": "binh.tran@congty.vn", "name": "Trần Thị Bình",
+                                       "department": "Kỹ thuật"})
+        sc = await call(c, "start_cycle")
+        check(sc["email"]["pending"] == 6 and "6 email chờ lọc" in sc["next_steps"][0],
+              "start_cycle: báo có 6 email chờ lọc")
 
         ov = await call(c, "get_overview")
         check(ov["pending"] == 6 and ov["total_reports"] == 0, "overview: 6 chờ duyệt, 0 đã lưu")
@@ -84,7 +95,7 @@ async def run() -> None:
         check(first["subject"] == "Báo giá thiết bị kho" and first["labels"] == "Khách hàng"
               and first["is_employee"] is False, "email cũ nhất trước, có nhãn Gmail, nhận diện người ngoài")
         ids = {m["message_id"]: None for m in MAILS}
-        lst = await call(c, "list_reports", status="pending", limit=50)
+        lst = api("GET", "/api/reports?status=pending&limit=50")
         by_subject = {x["subject"]: x["id"] for x in lst["reports"]}
         ids = by_subject
 
@@ -141,8 +152,8 @@ async def run() -> None:
 
         rc = await call(c, "get_reports_content", category="bao_cao_ngay", date_from="2026-11-10", date_to="2026-11-11")
         check(rc["count"] == 2 and rc["reports"][0]["summary"], "get_reports_content lọc theo nhóm")
-        l = await call(c, "list_reports", tag="ke kho")
-        check(l["total"] == 2, "list_reports lọc theo tag")
+        l = await call(c, "get_digest", tag="ke kho", date_from="2026-11-01", date_to="2026-11-30")
+        check(l["total_matching"] == 2, "get_digest lọc theo tag")
 
         sub = await call(c, "check_submissions", date="2026-11-10")
         check(sub["submitted_count"] == 1 and sub["total_reports"] == 1,
@@ -163,19 +174,21 @@ async def run() -> None:
         check(p["total"] == 2 and {x["category"] for x in p["categories"]} == {"bao_cao_ngay", "khach_hang"}
               and p["top_tags"], "get_sender_profile theo tên không dấu")
 
-        pg = await call(c, "purge_discarded_emails", older_than_days=0)
-        check(pg["purged"] == 2, "purge_discarded_emails xoá dấu vết 2 email đã loại")
+        pg = api("POST", "/api/reports/purge-discarded", {"older_than_days": 0})
+        check(pg["purged"] == 2, "trang quản trị dọn dấu vết 2 email đã loại")
 
         print("4. Quy tắc lọc")
         u = await call(c, "update_filter_rules", rules="- Luôn giữ email từ @khachhang.vn")
         check(u["filter_rules"].endswith("- Luôn giữ email từ @khachhang.vn") and "GIỮ LẠI" in u["filter_rules"],
               "update_filter_rules append")
-        g = await call(c, "get_filter_rules")
-        check("@khachhang.vn" in g["filter_rules"], "get_filter_rules thấy quy tắc mới")
+        g = await call(c, "update_filter_rules")
+        check("@khachhang.vn" in g["filter_rules"], "update_filter_rules không tham số = xem quy tắc")
 
         prompts = [p.name for p in await c.list_prompts()]
-        check("loc_email_moi" in prompts and "diem_tin_tuan" in prompts and "viec_can_xu_ly" in prompts,
-              "có prompt loc_email_moi, diem_tin_tuan, viec_can_xu_ly")
+        check(set(prompts) == {"tro_ly_dinh_ky", "tong_hop_bao_cao_ngay", "diem_tin_ceo", "thong_ke_bao_cao"},
+              "4 prompt: tro_ly_dinh_ky, tong_hop_bao_cao_ngay, diem_tin_ceo, thong_ke_bao_cao")
+        pr = await c.get_prompt("thong_ke_bao_cao", {"date_from": "2026-11-01", "date_to": "2026-11-30"})
+        check("từ 2026-11-01 đến 2026-11-30" in pr.messages[0].content.text, "prompt thống kê nhận khoảng ngày")
 
 
 def main() -> None:

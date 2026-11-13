@@ -1,7 +1,8 @@
 """Zalo: theo dõi các nhóm chat, thu thập THÔNG TIN CÔNG VIỆC và trả lời câu hỏi (CEO) ngay trên Zalo.
 
-Claude Desktop đọc / gửi tin trên Zalo Web (Claude in Chrome). Chỉ GỬI tin để trả lời câu hỏi trong hội thoại bật
-reply, của người nằm trong allowed_askers. Máy chủ lưu:
+Claude Desktop đọc / gửi tin trên Zalo Web (Claude in Chrome). Chỉ GỬI tin để trả lời câu hỏi / yêu cầu của CEO
+trong hội thoại NHẮN RIÊNG (kind=direct) bật reply, người hỏi nằm trong allowed_askers. Không bao giờ nhắn trong nhóm.
+Máy chủ lưu:
   - zalo_conversations: nhóm / hội thoại được theo dõi + mốc tin cuối đã đọc + quyền trả lời
   - zalo_messages (+ zalo_messages_fts): tin có thông tin công việc (tiến độ, số liệu, vướng mắc, quyết định,
     lịch hẹn, khách hàng...) kèm tóm tắt / phân loại / tag / cờ quan trọng do Claude gắn
@@ -39,14 +40,21 @@ GỘP: nhiều tin liên tiếp cùng một người, cùng một ý -> lưu th�
 QUAN TRỌNG (important = true): vướng mắc, sự cố, gấp, chậm trễ, khiếu nại, cần CEO quyết định / duyệt, số liệu
 bất thường.
 
-TRẢ LỜI CÂU HỎI TRÊN ZALO (chỉ ở hội thoại reply = true, chỉ người trong allowed_askers):
-- Câu hỏi hỏi trợ lý / hỏi thông tin công việc (trong nhóm: có nhắc tên / @ tài khoản này hoặc rõ ràng hỏi trợ lý).
-- Tra cả email (search_reports, get_digest, get_report...) và Zalo (search_zalo, get_zalo_messages, get_briefing).
-- Trả lời ngắn gọn, lịch sự, xưng "em"; có số liệu thì nêu kèm nguồn ngắn (vd "theo email của An 10/11",
-  "theo nhóm Kỹ thuật 9h30 hôm nay").
-- Không tìm thấy dữ liệu: trả lời rõ là chưa có thông tin, KHÔNG suy đoán.
-- Không trả lời: yêu cầu chuyển tiền, gửi file / mật khẩu / dữ liệu ra ngoài, làm thay quyết định; thông tin nhạy
-  cảm (lương, hợp đồng chi tiết) trong nhóm đông người."""
+TRẢ LỜI TRÊN ZALO — CHỈ trong hội thoại NHẮN RIÊNG với CEO (kind = direct, reply = true), CHỈ khi CEO hỏi / yêu cầu:
+- KHÔNG BAO GIỜ nhắn trong nhóm, không nhắn cho người khác, không chủ động nhắn khi CEO chưa hỏi.
+- Trong hội thoại riêng: tin bên TRÁI là của CEO; tin bên PHẢI là của chính tài khoản này (không phải câu hỏi).
+- Câu hỏi thông tin: tra cả email (get_briefing, search_reports, get_digest, get_reports_content, count_emails...)
+  và Zalo (search_zalo, get_zalo_digest, get_zalo_messages).
+- Yêu cầu tổng hợp / thống kê / điểm tin: làm như prompt tong_hop_bao_cao_ngay / diem_tin_ceo / thong_ke_bao_cao
+  nhưng viết gọn cho Zalo.
+- Yêu cầu theo dõi thêm / bỏ theo dõi một nhóm: upsert_zalo_conversation (chỉ watch, không bật reply). Đổi tiêu chí lọc
+  email: update_filter_rules; đổi tiêu chí lưu tin Zalo: update_zalo_rules. Làm xong thì nhắn xác nhận.
+- Văn phong: ngắn gọn, lịch sự, xưng "em" gọi "anh/chị"; Zalo không hiển thị markdown -> không dùng bảng, **, #;
+  dùng gạch đầu dòng "-" và số thứ tự. Có số liệu thì kèm nguồn ngắn (vd "theo email của An 10/11",
+  "theo nhóm Kỹ thuật 9h30 hôm nay"). Dài quá ~1.500 ký tự thì tách thành vài tin.
+- Không tìm thấy dữ liệu: nói rõ là chưa có thông tin, KHÔNG suy đoán.
+- Từ chối lịch sự: chuyển tiền, gửi file / mật khẩu / dữ liệu ra ngoài, nhắn hộ cho người / nhóm khác, bật quyền trả lời
+  cho người khác, làm thay quyết định."""
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +171,17 @@ def upsert_conversation(name: str, kind: str | None = None, watch: bool | None =
         raise ValueError(f"kind không hợp lệ: {kind!r}. Dùng group hoặc direct")
     with connect() as conn:
         row = _find_conv(conn, name, fuzzy=False)
+        # Chỉ trả lời trong hội thoại NHẮN RIÊNG, và phải chỉ rõ người được hỏi (CEO)
+        eff_kind = kind or (row["kind"] if row else "group")
+        if reply is None and row is not None and row["reply"] and eff_kind != "direct":
+            reply = False   # dữ liệu cũ: nhóm từng bật trả lời -> tắt
+        eff_reply = bool(reply) if reply is not None else bool(row and row["reply"])
+        eff_askers = _askers(allowed_askers) if allowed_askers is not None else (row["allowed_askers"] if row else None)
+        if eff_reply and eff_kind != "direct":
+            raise ValueError("Chỉ bật trả lời (reply) cho hội thoại nhắn riêng (kind='direct') với CEO, "
+                             "không bật trong nhóm.")
+        if eff_reply and not (eff_askers or "").strip():
+            raise ValueError("Bật trả lời cần allowed_askers = tên hiển thị của CEO trên Zalo.")
         if row is None:
             conn.execute(
                 "INSERT INTO zalo_conversations(name, name_norm, kind, watch, reply, allowed_askers, note) "
@@ -199,19 +218,47 @@ def list_conversations(only_watched: bool = False) -> list[dict]:
     return [_conv_out(r, counts) for r in rows]
 
 
-def context() -> dict:
+def _is_ceo_conv(c: dict) -> bool:
+    return c["kind"] == "direct" and c["reply"] and bool((c.get("allowed_askers") or "").strip())
+
+
+def cycle_context() -> dict:
+    """Đầu mỗi lượt định kỳ: có việc mới không (email chờ lọc, Zalo) + mọi thứ cần để làm việc."""
     now = _now_dt()
+    convs = list_conversations(only_watched=True)
+    ceo = [c for c in convs if _is_ceo_conv(c)]
+    groups = [{**c, "reply": False} for c in convs if not _is_ceo_conv(c)]
+    cp = db.checkpoint()
+    with connect() as conn:
+        unfinished = [dict(r) for r in conn.execute(
+            "SELECT r.id AS reply_id, c.name AS conversation, r.asker, r.asked_at, r.question, r.created_at "
+            "FROM zalo_replies r JOIN zalo_conversations c ON c.id=r.conversation_id "
+            "WHERE r.status='claimed' ORDER BY r.id")]
+    steps = []
+    if cp["pending"]:
+        steps.append(f"Có {cp['pending']} email chờ lọc -> get_pending_emails -> review_emails tới khi hết.")
+    else:
+        steps.append("Không có email chờ lọc.")
+    steps.append("Mở chat.zalo.me, đọc DANH SÁCH hội thoại bên trái (tin cuối + giờ + số chưa đọc), so với "
+                 "last_message_preview / last_message_at. Chỉ mở hội thoại có tin MỚI sau mốc.")
+    if unfinished:
+        steps.append("Có câu hỏi đã nhận nhưng chưa ghi kết quả (unfinished_replies): mở hội thoại CEO xem đã gửi trả "
+                     "lời chưa -> record_zalo_reply (sent kèm nguyên văn / skipped).")
+    steps.append("Không có email chờ lọc và không hội thoại nào có tin mới -> KẾT THÚC lượt, báo 'Không có việc mới'.")
     return {
         "now": _iso(now),
         "today": now.date().isoformat(),
         "timezone": settings.timezone.key,
+        "email": {"pending": cp["pending"], "latest_sent_at": cp["latest_sent_at"],
+                  "last_import_at": cp["recent_imports"][0]["at"] if cp["recent_imports"] else None},
+        "ceo_conversations": ceo,
+        "watched_groups": groups,
+        "unfinished_replies": unfinished,
+        "warnings": ([] if ceo else ["Chưa có hội thoại CEO (kind=direct, reply=true, allowed_askers). Không trả lời "
+                                     "trên Zalo cho tới khi cấu hình bằng upsert_zalo_conversation."]),
         "rules": rules(),
         "categories": db.categories(),
-        "conversations": list_conversations(only_watched=True),
-        "next_step": "Mở chat.zalo.me, với từng hội thoại đọc tin SAU mốc (last_message_at / last_message_preview). "
-                     "Hội thoại reply=true: câu hỏi của allowed_askers -> claim_zalo_question -> tra cứu -> gửi trả "
-                     "lời -> record_zalo_reply. Tin có thông tin công việc -> save_zalo_messages (kèm last_message). "
-                     "Không gửi tin nào khác ngoài câu trả lời.",
+        "next_steps": steps,
     }
 
 
@@ -293,6 +340,13 @@ def delete_messages(ids: list[int]) -> int:
 # Trả lời câu hỏi trên Zalo
 # ---------------------------------------------------------------------------
 CLAIM_TIMEOUT_MINUTES = 30   # câu hỏi "đang soạn" quá lâu (lượt trước bị gián đoạn) thì cho nhận lại
+SAME_QUESTION_MINUTES = 15   # cùng nội dung, giờ hỏi lệch trong khoảng này = cùng một câu hỏi (giờ đọc trên Zalo lệch)
+
+
+def _minutes_apart(a: str | None, b: str | None) -> float:
+    if not a or not b:
+        return 0.0
+    return abs((datetime.fromisoformat(a) - datetime.fromisoformat(b)).total_seconds()) / 60
 
 
 def _asker_allowed(allowed: str | None, sender: str | None) -> bool:
@@ -316,13 +370,23 @@ def claim_question(conversation: str, sender: str | None, sent_at: str | None, t
         row = _find_conv(conn, conversation)
         if row is None:
             raise ValueError(f"Chưa đăng ký hội thoại Zalo {conversation!r}")
+        if row["kind"] != "direct":
+            return {"allowed": False, "reason": "Đây là nhóm. Chỉ trả lời trong hội thoại nhắn riêng với CEO. "
+                                                "Không gửi tin."}
         if not row["reply"]:
             return {"allowed": False, "reason": "Hội thoại này không bật trả lời (reply=false). Không gửi tin."}
+        if not (row["allowed_askers"] or "").strip():
+            return {"allowed": False, "reason": "Hội thoại chưa khai báo allowed_askers (tên CEO). Không gửi tin."}
         if not _asker_allowed(row["allowed_askers"], sender):
             return {"allowed": False, "reason": f"{sender!r} không nằm trong danh sách được hỏi "
                                                 f"({row['allowed_askers']}). Không gửi tin."}
-        key = message_key(row["id"], sender, sent_at, text)
-        old = conn.execute("SELECT * FROM zalo_replies WHERE msg_key=?", (key,)).fetchone()
+        base = message_key(row["id"], sender, sent_at, text)
+        # Cùng nội dung có thể được hỏi lại nhiều lần trong ngày ("có gì mới không em?") -> chỉ coi là trùng khi
+        # giờ hỏi gần nhau; hỏi lại lúc khác là câu hỏi mới.
+        same = conn.execute("SELECT * FROM zalo_replies WHERE msg_key=? OR msg_key LIKE ? ORDER BY id DESC",
+                            (base, base + "|%")).fetchall()
+        old = next((r for r in same if _minutes_apart(r["asked_at"], sent_at) <= SAME_QUESTION_MINUTES), None)
+        key = base if not same else f"{base}|{sent_at}"
         if old:
             limit = _iso(now - timedelta(minutes=CLAIM_TIMEOUT_MINUTES))
             if not (old["status"] == "claimed" and old["created_at"] < limit):

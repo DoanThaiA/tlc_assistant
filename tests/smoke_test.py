@@ -1,4 +1,4 @@
-"""Kiểm thử đầu-cuối: chạy server HTTP thật trên CSDL tạm, nạp dữ liệu mẫu qua tool và gọi các tool hỏi đáp.
+"""Kiểm thử đầu-cuối: chạy server HTTP thật trên CSDL tạm, nạp dữ liệu mẫu qua REST và gọi các tool hỏi đáp.
 
 Chạy:  uv run python tests/smoke_test.py
 """
@@ -56,6 +56,18 @@ def wait_health(timeout: float = 20) -> None:
     raise RuntimeError("Server không khởi động")
 
 
+def api(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    """REST của trang quản trị (nhập tay / xoá / nhân viên không còn mở qua MCP)."""
+    req = urllib.request.Request(f"{BASE}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"content-type": "application/json", "authorization": f"Bearer {KEY}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
 async def call(c: Client, tool: str, **args):
     res = await c.call_tool(tool, args)
     return res.structured_content if res.structured_content is not None else res.data
@@ -77,19 +89,20 @@ async def run_tests() -> None:
         tools = sorted(t.name for t in await c.list_tools())
         print("✓ tools:", tools)
 
-        r = await call(c, "save_reports", reports=SAMPLE, source="test")
-        print("✓ save_reports:", {k: r[k] for k in ("inserted", "duplicate", "failed")})
-        assert r["inserted"] == 4 and r["failed"] == 0, r
-        dates = [x["report_date"] for x in r["results"]]
-        assert dates == ["2026-11-10", "2026-11-10", "2026-11-10", "2026-11-11"], dates
+        removed = {"save_reports", "get_import_checkpoint", "delete_report", "upsert_employee", "list_reports",
+                   "purge_discarded_emails", "get_filter_rules", "get_zalo_context"}
+        assert not removed & set(tools) and "start_cycle" in tools, tools
+        print("✓ đã bỏ tool quản trị / không liên quan")
 
-        r = await call(c, "save_reports", reports=SAMPLE[:2])
-        assert r["duplicate"] == 2 and r["inserted"] == 0, r
-        print("✓ gửi lại -> bỏ qua trùng")
-
-        bad = await call(c, "save_reports", reports=[{"sender_email": "khong-hop-le", "body": "x"}])
-        assert bad["failed"] == 1
-        print("✓ dòng lỗi được báo riêng:", bad["results"][0]["error"])
+    # Nạp dữ liệu mẫu qua REST quản trị
+    dates = []
+    for item in SAMPLE:
+        code, r = api("POST", "/api/reports", {**item, "source": "test"})
+        assert code == 201, (code, r)
+        dates.append(r["report_date"])
+    assert dates == ["2026-11-10", "2026-11-10", "2026-11-10", "2026-11-11"], dates
+    assert api("POST", "/api/reports", SAMPLE[0])[0] == 409
+    print("✓ nạp mẫu qua /api/reports, ngày báo cáo suy từ tiêu đề, chống trùng")
 
     # 3) Key qua header Bearer
     async with Client(StreamableHttpTransport(f"{BASE}/mcp", headers={"Authorization": f"Bearer {KEY}"})) as c:
@@ -97,11 +110,12 @@ async def run_tests() -> None:
                   ("binh.tran@congty.vn", "Trần Thị Bình", "Kỹ thuật"),
                   ("cuong.le@congty.vn", "Lê Văn Cường", "Vận hành"),
                   ("dung.pham@congty.vn", "Phạm Văn Dũng", "Kinh doanh")]:
-            await call(c, "upsert_employee", email=e[0], name=e[1], department=e[2])
+            assert api("POST", "/api/employees", {"email": e[0], "name": e[1], "department": e[2]})[0] == 201
 
-        cp = await call(c, "get_import_checkpoint")
-        assert cp["latest_sent_at"] == "2026-11-11T17:30:00+07:00", cp
-        print("✓ checkpoint:", cp["latest_sent_at"])
+        cp = await call(c, "start_cycle")
+        assert cp["email"]["latest_sent_at"] == "2026-11-11T17:30:00+07:00" and cp["email"]["pending"] == 0, cp
+        assert cp["warnings"] and not cp["ceo_conversations"], cp
+        print("✓ start_cycle:", cp["email"]["latest_sent_at"], "| không có email chờ lọc")
 
         s = await call(c, "search_reports", query="da nang hop dong")
         assert s["count"] == 1 and "Đà Nẵng" in s["results"][0]["snippet"], s
@@ -119,8 +133,8 @@ async def run_tests() -> None:
 
         d = await call(c, "get_reports_content", date_from="2026-11-01", date_to="2026-11-30", employee="nguyen van an")
         assert d["count"] == 2, d
-        d = await call(c, "list_reports", employee="kinh doanh")
-        assert d["total"] == 2, d
+        d = await call(c, "get_digest", employee="kinh doanh", date_from="2026-11-01", date_to="2026-11-30")
+        assert d["total_matching"] == 2, d
         print("✓ lọc nhân viên theo tên không dấu / phòng ban")
 
         sub = await call(c, "check_submissions", date="2026-11-10")
@@ -135,15 +149,16 @@ async def run_tests() -> None:
         rid = binh["id"]
         full = await call(c, "get_report", report_id=rid)
         assert full["subject"] == "Report 10/11"
-        assert (await call(c, "delete_report", report_id=rid))["deleted"] is True
-        print("✓ get_report / delete_report")
+        assert api("DELETE", f"/api/reports/{rid}")[0] == 200
+        print("✓ get_report / xoá qua trang quản trị")
 
         ov = await call(c, "get_overview")
         print("✓ overview:", json.dumps(ov, ensure_ascii=False))
 
         prompts = await c.list_prompts()
-        assert "tong_hop_bao_cao_ngay" in [p.name for p in prompts]
-        print("✓ prompt:", prompts[0].name)
+        assert {p.name for p in prompts} == {"tro_ly_dinh_ky", "tong_hop_bao_cao_ngay", "diem_tin_ceo",
+                                             "thong_ke_bao_cao"}, [p.name for p in prompts]
+        print("✓ prompts:", sorted(p.name for p in prompts))
 
     # 4) REST /ingest (dùng cho Google Apps Script)
     def post_ingest(payload: dict, key: str | None = KEY) -> tuple[int, dict]:
