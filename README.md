@@ -154,7 +154,7 @@ Cùng một server, cùng domain:
 
 | URL | Dùng cho |
 |---|---|
-| `https://<domain>/` | Giao diện quản trị: tổng quan, ai chưa nộp, xem/thêm/sửa/xoá báo cáo (kèm văn bản file đính kèm), **lịch sử trả lời của trợ lý**, quản lý nhân viên, nhập CSV, nhật ký nhập |
+| `https://<domain>/` | Giao diện quản trị: tổng quan, ai chưa nộp, xem/thêm/sửa/xoá báo cáo (kèm văn bản file đính kèm), **hội thoại Zalo (được trả lời / chỉ đọc)**, **lịch sử trả lời của trợ lý**, quản lý nhân viên, nhập CSV, nhật ký nhập |
 | `https://<domain>/mcp` | MCP cho Claude (cần API key) |
 | `https://<domain>/api/*` | REST API của giao diện |
 | `https://<domain>/ingest` | Apps Script đẩy mail |
@@ -178,14 +178,30 @@ Sai mật khẩu 10 lần trong 10 phút thì IP đó bị khoá tạm.
 | `GET/PUT /api/rules` `{filter_rules, categories}` | Quy tắc lọc và danh mục phân loại |
 | `POST /api/reports/purge-discarded` `{older_than_days}` | Dọn dấu vết email đã loại |
 | `GET /api/replies?q=&conversation_id=&status=&asker=&date_from=&date_to=&limit=&offset=` · `GET /api/replies/{id}` | Lịch sử câu hỏi / câu trả lời của trợ lý trên Zalo, chi tiết kèm email / tin Zalo nguồn |
-| `GET /api/replies/stats?date_from=&date_to=` · `GET /api/zalo/conversations` | Thống kê trả lời (theo trạng thái, ngày, hội thoại, người hỏi, thời gian phản hồi) |
+| `GET /api/replies/stats?date_from=&date_to=` | Thống kê trả lời (theo trạng thái, ngày, hội thoại, người hỏi, thời gian phản hồi) |
+| `GET/POST /api/zalo/conversations` · `PUT/DELETE /api/zalo/conversations/{id}` `{name, kind, mode, allowed_askers, note}` | Hội thoại Zalo: `mode` = `reply` (trợ lý được trả lời) / `read` (chỉ đọc) / `off` (ngừng theo dõi) |
+| `GET/PUT /api/zalo/rules` `{rules}` | Quy tắc thu thập & trả lời Zalo |
+
+**Tab "Nhóm Zalo"** (`/#/zalo`): tự cấu hình trợ lý được gửi tin ở đâu. Mỗi hội thoại (nhóm chat hoặc nhắn riêng) có
+một chế độ:
+
+| Chế độ | Trợ lý làm gì |
+|---|---|
+| **Trợ lý được trả lời** | Đọc và trả lời khi có người hỏi — nơi duy nhất trợ lý gửi tin. Nhắn riêng: bắt buộc khai báo người được hỏi (CEO). Nhóm: để trống "Ai được hỏi" = mọi thành viên |
+| **Chỉ đọc** | Đọc, lưu thông tin công việc, không bao giờ gửi tin |
+| **Ngừng theo dõi** | Không quét nữa; tin đã lưu và lịch sử trả lời vẫn giữ |
+
+Tên hội thoại phải gõ đúng như hiển thị trên Zalo Web. Thay đổi có hiệu lực ở lượt định kỳ kế tiếp. Xoá hội thoại là
+xoá luôn tin đã lưu và lịch sử trả lời của nó — muốn giữ dữ liệu thì chọn "Ngừng theo dõi". Cuối trang có ô sửa
+**quy tắc thu thập & trả lời Zalo** (nút "Khôi phục mặc định" điền lại quy tắc gốc).
 
 **Tab "Trợ lý trả lời"** (`/#/replies`): mỗi câu hỏi trợ lý nhận trên Zalo — ai hỏi, ở hội thoại nào, lúc nào, trợ lý
 trả lời gì (nguyên văn), sau bao lâu, dựa trên email / tin Zalo nào, hoặc vì sao bỏ qua. Có thẻ tổng hợp (số câu hỏi,
 đã trả lời, bỏ qua, thời gian phản hồi trung vị), biểu đồ theo ngày (bấm cột để lọc ngày đó), thống kê theo hội thoại
 và người hỏi, tìm không dấu trong câu hỏi / câu trả lời. Câu "Dở dang" = trợ lý đã nhận quá 30 phút mà chưa ghi kết quả.
 
-Kiểm thử: `uv run python tests/admin_test.py`, `uv run python tests/attachments_test.py`.
+Kiểm thử: `uv run python tests/admin_test.py`, `uv run python tests/attachments_test.py`,
+`uv run python tests/zalo_admin_test.py`.
 
 ## Kết nối Claude
 
@@ -285,7 +301,8 @@ Chuẩn bị (một lần):
 
 1. Claude Desktop có connector này + tiện ích **Claude in Chrome**; Chrome đã đăng nhập `chat.zalo.me`.
    Máy phải bật, Chrome mở, Zalo Web còn đăng nhập.
-2. Nói với Claude (trong Claude Desktop) để khai báo hội thoại, vd:
+2. Khai báo hội thoại trên trang quản trị, tab **Nhóm Zalo** (xem [Trang quản trị](#trang-quản-trị-dữ-liệu-giao-diện-web)).
+   Hoặc nói với Claude (trong Claude Desktop), vd:
    *"Theo dõi nhóm 'Ban Lãnh Đạo Họp Tuần - Tháng' (chỉ đọc). Nhóm 'Trợ lý CEO TLC VIỆT NAM' là nhóm trợ lý: kind
    group, bật trả lời, mọi thành viên được hỏi."* → Claude gọi `upsert_zalo_conversation`. Muốn chỉ trả lời CEO
    nhắn riêng: hội thoại kind direct, bật trả lời, `allowed_askers` = tên CEO. `allowed_askers` khớp theo **tên hiển
@@ -408,7 +425,8 @@ uv run python tests/smoke_test.py
 
 Lệnh trên chạy kiểm thử đầu-cuối: dựng server HTTP thật trên CSDL tạm và gọi toàn bộ tool. Các kiểm thử khác:
 `tests/flow_test.py` (lọc + hỏi đáp email), `tests/zalo_test.py` (Zalo: thu thập, trả lời, điểm tin), `tests/admin_test.py`,
-`tests/attachments_test.py` (đọc file đính kèm + trang lịch sử trả lời).
+`tests/attachments_test.py` (đọc file đính kèm + trang lịch sử trả lời), `tests/zalo_admin_test.py` (cấu hình hội
+thoại Zalo trên trang quản trị).
 
 Muốn nạp dữ liệu cũ từ file JSON (mảng object cùng cấu trúc với body của `/ingest`):
 

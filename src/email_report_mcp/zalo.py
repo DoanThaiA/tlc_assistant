@@ -758,3 +758,119 @@ def reply_stats(date_from: str, date_to: str) -> dict:
                              "max": times[-1] if times else None, "count": len(times)},
         "per_day": per_day, "by_conversation": by_conv, "top_askers": askers,
     }
+
+
+# ---------------------------------------------------------------------------
+# Trang quản trị: cấu hình hội thoại Zalo (trả lời / chỉ đọc / ngừng theo dõi)
+# ---------------------------------------------------------------------------
+MODES = ("reply", "read", "off")
+
+
+def conv_mode(c: dict) -> str:
+    if not c["watch"]:
+        return "off"
+    return "reply" if _is_reply_conv(c) else "read"
+
+
+def admin_conversations() -> list[dict]:
+    """Mọi hội thoại + chế độ + số tin đã lưu + số câu đã trả lời / lần cuối trả lời."""
+    convs = list_conversations()
+    with connect() as conn:
+        stats = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+            "SELECT conversation_id, COUNT(*), SUM(status='sent'), MAX(replied_at) FROM zalo_replies "
+            "GROUP BY conversation_id")}
+    for c in convs:
+        total, sent, last = stats.get(c["id"], (0, 0, None))
+        c.update(mode=conv_mode(c), questions=total, replies_sent=sent or 0, last_replied_at=last)
+    return convs
+
+
+def _mode_fields(mode: str) -> tuple[int, int]:
+    if mode not in MODES:
+        raise ValueError(f"mode phải là một trong {MODES}")
+    return {"reply": (1, 1), "read": (1, 0), "off": (0, 0)}[mode]
+
+
+def _admin_values(data: dict, old: sqlite3.Row | None) -> dict:
+    name = nfc(str(data.get("name") if data.get("name") is not None else (old["name"] if old else ""))).strip()
+    if not name:
+        raise ValueError("Cần tên hội thoại (đúng như hiển thị trên Zalo)")
+    if len(name) > 200:
+        raise ValueError("Tên hội thoại quá dài")
+    kind = data.get("kind") or (old["kind"] if old else "group")
+    if kind not in KINDS:
+        raise ValueError("Loại phải là group (nhóm) hoặc direct (nhắn riêng)")
+    if data.get("mode") is not None:
+        watch, reply = _mode_fields(str(data["mode"]))
+    else:
+        watch = int(bool(data["watch"])) if data.get("watch") is not None else (old["watch"] if old else 1)
+        reply = int(bool(data["reply"])) if data.get("reply") is not None else (old["reply"] if old else 0)
+    if reply and not watch:
+        raise ValueError("Hội thoại được trả lời phải đang theo dõi")
+    if "allowed_askers" in data:
+        askers = _askers(data["allowed_askers"] if data["allowed_askers"] is not None else "") or None
+    else:
+        askers = old["allowed_askers"] if old else None
+    if isinstance(askers, str):
+        askers = ", ".join(a for a in (x.strip() for x in re.split(r"[,\n]", askers)) if a) or None
+    if reply and kind == "direct" and not askers:
+        raise ValueError("Hội thoại nhắn riêng được trả lời phải khai báo người được hỏi (tên hiển thị của CEO trên "
+                         "Zalo) — nếu không, ai nhắn riêng cho tài khoản này cũng được trợ lý trả lời.")
+    if data.get("note") is not None:
+        note = nfc(str(data["note"])).strip() or None
+    else:
+        note = old["note"] if old else None
+    return {"name": name, "name_norm": _squash(name), "kind": kind, "watch": watch, "reply": reply,
+            "allowed_askers": askers, "note": note}
+
+
+def _conv_by_id(conn: sqlite3.Connection, conv_id: int) -> dict:
+    counts = {r[0]: r[1] for r in conn.execute(
+        "SELECT conversation_id, COUNT(*) FROM zalo_messages WHERE conversation_id=? GROUP BY conversation_id",
+        (conv_id,))}
+    row = conn.execute("SELECT * FROM zalo_conversations WHERE id=?", (conv_id,)).fetchone()
+    c = _conv_out(row, counts)
+    c["mode"] = conv_mode(c)
+    return c
+
+
+def admin_create_conversation(data: dict) -> dict:
+    v = _admin_values(data, None)
+    with connect() as conn:
+        if conn.execute("SELECT 1 FROM zalo_conversations WHERE name_norm=?", (v["name_norm"],)).fetchone():
+            raise db.Conflict(f"Đã có hội thoại tên {v['name']!r}")
+        cur = conn.execute(
+            "INSERT INTO zalo_conversations(name, name_norm, kind, watch, reply, allowed_askers, note) "
+            "VALUES (:name,:name_norm,:kind,:watch,:reply,:allowed_askers,:note)", v)
+        return _conv_by_id(conn, cur.lastrowid)
+
+
+def admin_update_conversation(conv_id: int, data: dict) -> dict | None:
+    with connect() as conn:
+        old = conn.execute("SELECT * FROM zalo_conversations WHERE id=?", (conv_id,)).fetchone()
+        if old is None:
+            return None
+        v = _admin_values(data, old)
+        dup = conn.execute("SELECT id FROM zalo_conversations WHERE name_norm=? AND id<>?",
+                           (v["name_norm"], conv_id)).fetchone()
+        if dup:
+            raise db.Conflict(f"Đã có hội thoại khác tên {v['name']!r}")
+        conn.execute("UPDATE zalo_conversations SET name=:name, name_norm=:name_norm, kind=:kind, watch=:watch, "
+                     "reply=:reply, allowed_askers=:allowed_askers, note=:note WHERE id=:id", {**v, "id": conv_id})
+        if v["name"] != old["name"]:  # tên hội thoại nằm trong chỉ mục tìm kiếm của tin đã lưu
+            for (mid,) in conn.execute("SELECT id FROM zalo_messages WHERE conversation_id=?", (conv_id,)).fetchall():
+                _index(conn, mid)
+        return _conv_by_id(conn, conv_id)
+
+
+def admin_delete_conversation(conv_id: int) -> dict | None:
+    """Xoá hẳn hội thoại cùng tin đã lưu và lịch sử trả lời của nó."""
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM zalo_conversations WHERE id=?", (conv_id,)).fetchone():
+            return None
+        conn.execute("DELETE FROM zalo_messages_fts WHERE rowid IN "
+                     "(SELECT id FROM zalo_messages WHERE conversation_id=?)", (conv_id,))
+        msgs = conn.execute("DELETE FROM zalo_messages WHERE conversation_id=?", (conv_id,)).rowcount
+        reps = conn.execute("DELETE FROM zalo_replies WHERE conversation_id=?", (conv_id,)).rowcount
+        conn.execute("DELETE FROM zalo_conversations WHERE id=?", (conv_id,))
+    return {"deleted": 1, "id": conv_id, "messages_deleted": msgs, "replies_deleted": reps}

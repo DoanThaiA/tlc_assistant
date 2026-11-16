@@ -491,7 +491,42 @@ async def reply_get(request: Request) -> Any:
 
 @api
 async def zalo_conversations(_: Request) -> Any:
-    return {"conversations": await _run(zalo.list_conversations)}
+    return {"conversations": await _run(zalo.admin_conversations)}
+
+
+@api
+async def zalo_conversation_create(request: Request) -> Any:
+    return _json(await _run(zalo.admin_create_conversation, await _body(request)), 201)
+
+
+@api
+async def zalo_conversation_update(request: Request) -> Any:
+    c = await _run(zalo.admin_update_conversation, int(request.path_params["id"]), await _body(request))
+    if not c:
+        raise NotFound("Không tìm thấy hội thoại")
+    return c
+
+
+@api
+async def zalo_conversation_delete(request: Request) -> Any:
+    r = await _run(zalo.admin_delete_conversation, int(request.path_params["id"]))
+    if not r:
+        raise NotFound("Không tìm thấy hội thoại")
+    return r
+
+
+@api
+async def zalo_rules_get(_: Request) -> Any:
+    return {"rules": await _run(zalo.rules), "default_rules": zalo.DEFAULT_ZALO_RULES}
+
+
+@api
+async def zalo_rules_put(request: Request) -> Any:
+    rules = (await _body(request)).get("rules")
+    if not isinstance(rules, str) or not rules.strip():
+        raise ValueError("Quy tắc Zalo không được để trống")
+    res = await _run(zalo.save_rules, rules, "replace")
+    return {"rules": res["rules"], "default_rules": zalo.DEFAULT_ZALO_RULES}
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +556,11 @@ def register(mcp: Any) -> None:
     route("/api/replies/stats", methods=["GET"])(replies_stats)
     route("/api/replies/{id:int}", methods=["GET"])(reply_get)
     route("/api/zalo/conversations", methods=["GET"])(zalo_conversations)
+    route("/api/zalo/conversations", methods=["POST"])(zalo_conversation_create)
+    route("/api/zalo/conversations/{id:int}", methods=["PUT"])(zalo_conversation_update)
+    route("/api/zalo/conversations/{id:int}", methods=["DELETE"])(zalo_conversation_delete)
+    route("/api/zalo/rules", methods=["GET"])(zalo_rules_get)
+    route("/api/zalo/rules", methods=["PUT"])(zalo_rules_put)
     route("/api/employees", methods=["GET"])(employees_list)
     route("/api/employees", methods=["POST"])(employee_create)
     route("/api/employees/import", methods=["POST"])(employees_import)

@@ -204,7 +204,7 @@ $("#logout").addEventListener("click", async () => {
 /* ------------------------------------------------------------------ */
 const views = {
   overview: viewOverview, pending: viewPending, reports: viewReports, employees: viewEmployees,
-  rules: viewRules, imports: viewImports, replies: viewReplies,
+  rules: viewRules, imports: viewImports, replies: viewReplies, zalo: viewZalo,
 };
 
 function route() {
@@ -1014,4 +1014,205 @@ async function replyDetail(id) {
     ],
     footer: [h("button", { class: "btn", type: "button", onclick: closeModal }, "Đóng")],
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* HỘI THOẠI ZALO: trợ lý được trả lời / chỉ đọc / ngừng theo dõi       */
+/* ------------------------------------------------------------------ */
+const MODE_INFO = {
+  reply: { label: "Trợ lý được trả lời", badge: "ok",
+    desc: "Trợ lý đọc và TRẢ LỜI khi có người hỏi. Đây là nơi duy nhất trợ lý được gửi tin." },
+  read: { label: "Chỉ đọc", badge: "primary",
+    desc: "Trợ lý chỉ đọc, lưu thông tin công việc. Không bao giờ gửi tin trong hội thoại này." },
+  off: { label: "Ngừng theo dõi", badge: "",
+    desc: "Trợ lý không mở hội thoại này nữa. Tin đã lưu và lịch sử trả lời vẫn giữ." },
+};
+const KIND_LABEL = { group: "Nhóm chat", direct: "Nhắn riêng" };
+const zaloFilter = { mode: "", q: "" };
+
+const askersList = (s) => (s || "").split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+
+/** Một câu mô tả việc trợ lý sẽ làm với hội thoại này. */
+function modeSentence(mode, kind, askers) {
+  if (mode === "off") return "Trợ lý không quét hội thoại này.";
+  if (mode === "read") return "Trợ lý đọc tin mới mỗi lượt và lưu thông tin công việc. Không gửi tin nào.";
+  if (kind === "direct") {
+    return askers.length
+      ? `Trợ lý trả lời khi ${askers.join(" / ")} nhắn hỏi. Người khác nhắn: không trả lời.`
+      : "Chưa khai báo người được hỏi — bắt buộc với hội thoại nhắn riêng.";
+  }
+  return askers.length
+    ? `Trợ lý trả lời câu hỏi của ${askers.join(", ")} trong nhóm. Thành viên khác hỏi: không trả lời.`
+    : "Trợ lý trả lời câu hỏi của MỌI thành viên trong nhóm (chỉ khi được hỏi / được @), chỉ chia sẻ thông tin công việc chung.";
+}
+
+async function viewZalo(root) {
+  const f = zaloFilter;
+  const countsBox = h("div", { class: "grid cards" });
+  const tableBox = h("div", { class: "table-wrap" });
+  const rulesBox = h("div", { class: "panel panel-pad" });
+  let all = [];
+
+  const search = h("input", { type: "search", value: f.q, placeholder: "Tìm tên hội thoại, ghi chú, người được hỏi…",
+    oninput: debounce((e) => { f.q = e.target.value; render(); }, 200) });
+  const seg = h("div", { class: "seg-group", role: "group", "aria-label": "Lọc theo chế độ" });
+
+  root.append(
+    h("div", { class: "page-head" }, h("h1", {}, "Hội thoại Zalo"),
+      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "button", onclick: () => zaloForm(null, load) }, "+ Thêm hội thoại"))),
+    h("p", { class: "muted" }, "Chọn hội thoại nào trợ lý được gửi tin trả lời, hội thoại nào chỉ đọc. Trợ lý áp dụng ở lượt định kỳ kế tiếp (tối đa ~15 phút)."),
+    countsBox,
+    h("div", { class: "spacer" }),
+    h("div", { class: "panel" }, h("div", { class: "toolbar" }, seg, h("label", { class: "field grow" }, "Tìm", search)), tableBox),
+    h("div", { class: "spacer" }),
+    rulesBox);
+
+  async function load() {
+    tableBox.replaceChildren(h("div", { class: "empty" }, "Đang tải…"));
+    try { all = (await api("GET", "/api/zalo/conversations")).conversations; } catch (e) { fail(e); return; }
+    render();
+  }
+
+  function render() {
+    const by = { reply: 0, read: 0, off: 0 };
+    for (const c of all) by[c.mode]++;
+    countsBox.replaceChildren(...Object.entries(MODE_INFO).map(([m, info]) =>
+      h("button", { type: "button", class: "panel panel-pad card mode-card" + (f.mode === m ? " active" : ""),
+        onclick: () => { f.mode = f.mode === m ? "" : m; render(); } },
+      h("div", { class: "label" }, h("span", { class: "dot " + (info.badge || "muted") }), info.label),
+      h("div", { class: "value" }, by[m]),
+      h("div", { class: "sub" }, info.desc))));
+    seg.replaceChildren(...[["", `Tất cả (${all.length})`], ["reply", "Được trả lời"], ["read", "Chỉ đọc"], ["off", "Ngừng theo dõi"]]
+      .map(([m, l]) => h("button", { type: "button", class: "btn sm" + (f.mode === m ? " primary" : ""),
+        "aria-pressed": f.mode === m ? "true" : "false", onclick: () => { f.mode = m; render(); } }, l)));
+
+    const q = (f.q || "").normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/gi, "d").toLowerCase();
+    const fold = (s) => (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/gi, "d").toLowerCase();
+    const rows = all.filter((c) => (!f.mode || c.mode === f.mode)
+      && (!q || fold([c.name, c.note, c.allowed_askers].join(" ")).includes(q)));
+    if (!all.length) {
+      tableBox.replaceChildren(h("div", { class: "empty" },
+        h("p", {}, "Chưa có hội thoại nào."),
+        h("button", { class: "btn primary", type: "button", onclick: () => zaloForm(null, load) }, "+ Thêm hội thoại đầu tiên")));
+      return;
+    }
+    if (!rows.length) { tableBox.replaceChildren(h("div", { class: "empty" }, "Không có hội thoại nào khớp bộ lọc.")); return; }
+    tableBox.replaceChildren(h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Hội thoại"), h("th", {}, "Chế độ"), h("th", {}, "Ai được hỏi trợ lý"),
+        h("th", {}, "Tin đã lưu"), h("th", {}, "Đã trả lời"), h("th", {}, "Quét gần nhất"), h("th", {}))),
+      h("tbody", {}, rows.map((c) => h("tr", { class: "clickable", onclick: (e) => { if (!e.target.closest("button")) zaloForm(c, load); } },
+        h("td", { class: "subject" }, h("div", { class: "title" }, c.name),
+          h("div", { class: "preview" }, KIND_LABEL[c.kind] + (c.note ? " · " + clip(c.note, 120) : ""))),
+        h("td", {}, h("span", { class: "badge " + MODE_INFO[c.mode].badge }, MODE_INFO[c.mode].label)),
+        h("td", { class: "small" }, c.mode !== "reply" ? h("span", { class: "muted" }, "—")
+          : askersList(c.allowed_askers).length ? askersList(c.allowed_askers).join(", ")
+            : h("span", { class: "badge warn", title: "Mọi thành viên nhóm đều hỏi được trợ lý" }, "Mọi thành viên")),
+        h("td", { class: "muted" }, c.saved_messages || 0),
+        h("td", { class: "muted nowrap" }, c.questions ? `${c.replies_sent}/${c.questions}` : "—"),
+        h("td", { class: "muted nowrap" }, c.last_scanned_at ? fmtDateTime(c.last_scanned_at) : "Chưa quét"),
+        h("td", { class: "actions" },
+          h("button", { class: "btn sm", type: "button", onclick: () => zaloForm(c, load) }, "Sửa"),
+          h("button", { class: "btn danger sm", type: "button", onclick: () => deleteConversation(c, load) }, "Xoá")))))));
+  }
+
+  async function loadRules() {
+    const data = await api("GET", "/api/zalo/rules");
+    const ta = h("textarea", { rows: 20, class: "mono", value: data.rules, "aria-label": "Quy tắc Zalo" });
+    const save = h("button", { class: "btn primary", type: "button", onclick: async () => {
+      save.disabled = true;
+      try { await api("PUT", "/api/zalo/rules", { rules: ta.value }); toast("Đã lưu quy tắc Zalo"); } catch (e) { fail(e); } finally { save.disabled = false; }
+    } }, "Lưu quy tắc");
+    rulesBox.replaceChildren(
+      h("div", { class: "page-head" }, h("h2", {}, "Quy tắc thu thập & trả lời trên Zalo"),
+        h("div", { class: "actions" },
+          h("button", { class: "btn", type: "button", onclick: () => { ta.value = data.default_rules; toast("Đã điền quy tắc mặc định — bấm Lưu để áp dụng"); } }, "Khôi phục mặc định"),
+          save)),
+      h("p", { class: "muted small" }, "Trợ lý đọc quy tắc này mỗi lượt: tin nào cần lưu, trả lời thế nào, thông tin gì không được chia sẻ trong nhóm."),
+      ta);
+  }
+
+  await Promise.all([load(), loadRules().catch(fail)]);
+}
+
+function zaloForm(c, onSaved) {
+  const isEdit = !!(c && c.id);
+  const v = c || { kind: "group", mode: "read" };
+  const radio = (name, value, checked, title, desc) => h("label", { class: "option" },
+    h("input", { type: "radio", name, value, checked }),
+    h("span", {}, h("strong", {}, title), desc ? h("span", { class: "muted small" }, desc) : null));
+
+  const askersTa = h("textarea", { name: "allowed_askers", rows: 3, class: "short", value: askersList(v.allowed_askers).join("\n"),
+    placeholder: "Mỗi dòng một tên, đúng tên hiển thị trên Zalo\nvd: Doãn Quốc Thái" });
+  const askersHint = h("span", { class: "muted small" });
+  const askersRow = h("label", { class: "full" }, "Ai được hỏi trợ lý", askersTa, askersHint);
+  const summary = h("div", { class: "mode-summary full", role: "status" });
+
+  const form = h("form", { class: "form-grid", id: "zalo-form" },
+    h("label", { class: "full" }, "Tên hội thoại *",
+      h("input", { name: "name", required: true, maxLength: 200, value: v.name || "", placeholder: "vd: Trợ lý CEO TLC VIỆT NAM" }),
+      h("span", { class: "muted small" }, "Gõ đúng tên hiển thị trên Zalo Web — trợ lý dùng tên này để tìm hội thoại.")),
+    h("fieldset", { class: "full options two" }, h("legend", {}, "Loại"),
+      radio("kind", "group", v.kind !== "direct", "Nhóm chat", null),
+      radio("kind", "direct", v.kind === "direct", "Nhắn riêng (1-1)", null)),
+    h("fieldset", { class: "full options" }, h("legend", {}, "Chế độ"),
+      ...Object.entries(MODE_INFO).map(([m, info]) => radio("mode", m, (v.mode || "read") === m, info.label, info.desc))),
+    askersRow,
+    h("label", { class: "full" }, "Ghi chú cho trợ lý",
+      h("textarea", { name: "note", rows: 3, class: "short", value: v.note || "", placeholder: "Nhóm này là gì, gồm ai, cần chú ý thông tin gì, xưng hô thế nào" })),
+    summary);
+
+  const el = (n) => form.elements.namedItem(n);
+  function update() {
+    const mode = el("mode").value;
+    const kind = el("kind").value;
+    const askers = askersList(askersTa.value);
+    askersRow.hidden = mode !== "reply";
+    askersTa.required = mode === "reply" && kind === "direct";
+    askersHint.textContent = kind === "direct"
+      ? "Bắt buộc: tên hiển thị của CEO. Chỉ người này nhắn mới được trả lời."
+      : "Để trống = mọi thành viên trong nhóm đều hỏi được trợ lý.";
+    summary.className = "mode-summary full " + (mode === "reply" ? (kind === "direct" && !askers.length ? "danger" : "ok") : mode === "read" ? "primary" : "");
+    summary.textContent = modeSentence(mode, kind, askers);
+  }
+  form.addEventListener("input", update);
+  form.addEventListener("change", update);
+  update();
+
+  const save = h("button", { class: "btn primary", type: "submit", form: "zalo-form" }, isEdit ? "Lưu" : "Thêm");
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const mode = el("mode").value;
+    const payload = { name: el("name").value, kind: el("kind").value, mode, note: el("note").value,
+      allowed_askers: mode === "reply" ? askersList(askersTa.value) : (isEdit ? askersList(v.allowed_askers) : []) };
+    save.disabled = true;
+    try {
+      if (isEdit) await api("PUT", `/api/zalo/conversations/${c.id}`, payload);
+      else await api("POST", "/api/zalo/conversations", payload);
+      toast(isEdit ? "Đã lưu hội thoại" : "Đã thêm hội thoại");
+      closeModal();
+      onSaved && onSaved();
+    } catch (ex) { fail(ex); } finally { save.disabled = false; }
+  });
+  openModal({
+    title: isEdit ? "Sửa hội thoại Zalo" : "Thêm hội thoại Zalo",
+    body: form,
+    footer: [
+      isEdit ? h("button", { class: "btn danger left", type: "button", onclick: () => deleteConversation(c, onSaved) }, "Xoá") : null,
+      h("button", { class: "btn", type: "button", onclick: closeModal }, "Huỷ"), save],
+  });
+  if (!isEdit) setTimeout(() => el("name").focus(), 50);
+}
+
+async function deleteConversation(c, onDone) {
+  const parts = [];
+  if (c.saved_messages) parts.push(`${c.saved_messages} tin đã lưu`);
+  if (c.questions) parts.push(`${c.questions} câu hỏi trong lịch sử trả lời`);
+  const msg = `Xoá hẳn hội thoại "${c.name}"${parts.length ? " cùng " + parts.join(" và ") : ""}? Không thể hoàn tác.`
+    + (parts.length ? " Muốn giữ dữ liệu thì chọn chế độ \"Ngừng theo dõi\" thay vì xoá." : "");
+  if (!(await confirmBox("Xoá hội thoại", msg))) return;
+  try {
+    await api("DELETE", `/api/zalo/conversations/${c.id}`);
+    toast("Đã xoá hội thoại");
+    onDone && onDone();
+  } catch (e) { fail(e); }
 }

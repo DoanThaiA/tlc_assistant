@@ -250,3 +250,25 @@ a.card-link:hover .card { border-color: var(--primary); }
 .attachment summary { cursor: pointer; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .attachment summary strong { word-break: break-all; }
 .attachment pre { margin-top: 8px; max-height: 420px; overflow: auto; }
+
+/* ---------- Hội thoại Zalo ---------- */
+button.card { font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.mode-card.active { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.mode-card .label { display: flex; align-items: center; gap: 6px; }
+.mode-card .dot { margin-left: 0; }
+.dot.muted { background: var(--muted); }
+.seg-group { display: flex; flex-wrap: wrap; gap: 6px; align-self: flex-end; }
+fieldset.options { border: 0; padding: 0; margin: 0; display: grid; gap: 8px; min-width: 0; }
+fieldset.options.two { grid-template-columns: 1fr 1fr; }
+fieldset.options legend { font-weight: 500; padding: 0; margin-bottom: 6px; }
+label.option { flex-direction: row; align-items: flex-start; gap: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 400; }
+label.option > span { display: flex; flex-direction: column; gap: 2px; }
+label.option input { width: 16px; height: 16px; margin: 2px 0 0; padding: 0; flex: none; accent-color: var(--primary); }
+label.option:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); }
+.mode-summary { border-radius: 8px; padding: 10px 12px; background: var(--hover); font-size: 13px; }
+.mode-summary.ok { background: var(--ok-soft); color: var(--ok); }
+.mode-summary.primary { background: var(--primary-soft); color: var(--primary); }
+.mode-summary.danger { background: var(--danger-soft); color: var(--danger); }
+[hidden] { display: none !important; }
+@media (max-width: 640px) { fieldset.options.two { grid-template-columns: 1fr; } }
+textarea.short { min-height: 72px; }
