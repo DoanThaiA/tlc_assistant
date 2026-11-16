@@ -120,6 +120,20 @@ CREATE TABLE IF NOT EXISTS zalo_replies (
     replied_at       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_zalo_replies_conv ON zalo_replies(conversation_id, created_at);
+
+-- File đính kèm chờ OCR (PDF scan, ảnh). Nội dung file chỉ giữ TẠM ở đây, xoá ngay sau khi OCR xong (xem ocr.py)
+CREATE TABLE IF NOT EXISTS ocr_queue (
+    id           INTEGER PRIMARY KEY,
+    report_id    INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    att_index    INTEGER NOT NULL,
+    att_name     TEXT NOT NULL,
+    mime_type    TEXT,
+    data         BLOB NOT NULL,
+    tries        INTEGER NOT NULL DEFAULT 0,
+    next_try_at  TEXT NOT NULL,
+    last_error   TEXT,
+    created_at   TEXT NOT NULL
+);
 """
 
 # Cột thêm sau (tự migrate CSDL cũ). Email cũ mặc định "kept".
@@ -454,11 +468,31 @@ def _index_fts(conn: sqlite3.Connection, rid: int) -> None:
     )
 
 
+def _split_ocr(atts: list[dict]) -> tuple[list[dict], list[tuple[int, str, str, bytes]]]:
+    """Tách nội dung file cần OCR (khoá "_ocr") khỏi danh sách đính kèm sẽ lưu JSON."""
+    clean, blobs = [], []
+    for i, a in enumerate(atts or []):
+        a = dict(a)
+        data = a.pop("_ocr", None)
+        if data:
+            blobs.append((i, a.get("name") or "", a.get("mime_type") or "", data))
+        clean.append(a)
+    return clean, blobs
+
+
+def _enqueue_ocr(conn: sqlite3.Connection, rid: int, blobs: list[tuple[int, str, str, bytes]]) -> None:
+    from . import ocr
+
+    for i, name, mime, data in blobs:
+        ocr.enqueue(conn, rid, i, name, mime, data)
+
+
 def insert_report(r: dict[str, Any]) -> int | None:
     """Lưu 1 email. Trả về id mới, hoặc None nếu đã tồn tại (trùng message_id)."""
     status = r.get("status") or "kept"
     if status not in STATUSES:
         raise ValueError(f"status không hợp lệ: {status}")
+    atts, blobs = _split_ocr(r.get("attachments") or [])
     with connect() as conn:
         cur = conn.execute(
             """INSERT OR IGNORE INTO reports
@@ -475,7 +509,7 @@ def insert_report(r: dict[str, Any]) -> int | None:
                 r["report_date"],
                 r.get("sent_at"),
                 nfc(r.get("body_text")),
-                json.dumps(r.get("attachments") or [], ensure_ascii=False),
+                json.dumps(atts, ensure_ascii=False),
                 r.get("to_addrs"),
                 r.get("cc_addrs"),
                 status,
@@ -491,6 +525,7 @@ def insert_report(r: dict[str, Any]) -> int | None:
             return None
         rid = cur.lastrowid
         _index_fts(conn, rid)
+        _enqueue_ocr(conn, rid, blobs)
         return rid
 
 
@@ -502,20 +537,30 @@ def merge_attachments(rid: int, new: list[dict]) -> bool:
         if not row or row["status"] == "discarded":
             return False
         old = json.loads(row["attachments"] or "[]")
+        new, blobs = _split_ocr(new)
+        data_of = {i: (name, mime, data) for i, name, mime, data in blobs}
         changed = False
-        for a in new:
-            if not a.get("text"):
+        queued: list[tuple[int, str, str, bytes]] = []
+        for k, a in enumerate(new):
+            if not a.get("text") and k not in data_of:
                 continue
-            same = next((o for o in old if o.get("name") == a.get("name") and not o.get("text")), None)
+            same = next((o for o in old if o.get("name") == a.get("name") and not o.get("text")
+                         and o.get("status") != "ocr_pending"), None)
             if same is not None:
-                old[old.index(same)] = a
-                changed = True
+                pos = old.index(same)
+                old[pos] = a
             elif not any(o.get("name") == a.get("name") for o in old):
+                pos = len(old)
                 old.append(a)
-                changed = True
+            else:
+                continue
+            changed = True
+            if k in data_of:
+                queued.append((pos, *data_of[k]))
         if changed:
             conn.execute("UPDATE reports SET attachments=? WHERE id=?", (json.dumps(old, ensure_ascii=False), rid))
             _index_fts(conn, rid)
+            _enqueue_ocr(conn, rid, queued)
         return changed
 
 
@@ -604,6 +649,7 @@ def review(decisions: list[dict[str, Any]]) -> dict:
                         fields["report_date"] = _check_date(d["report_date"], "report_date")
                     status = "kept"
                 elif action == "discard":
+                    conn.execute("DELETE FROM ocr_queue WHERE report_id=?", (rid,))
                     fields = {"status": "discarded", "body_text": "", "attachments": "[]", "summary": None,
                               "category": None, "tags": None, "to_addrs": None, "cc_addrs": None,
                               "reviewed_at": _now(), "review_note": note}

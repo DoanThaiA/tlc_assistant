@@ -181,7 +181,7 @@ def save_batch(items: list[dict[str, Any]], source: str | None, status: str = "k
                 old_id = db.find_by_message_id(r["message_id"])
                 res: dict[str, Any] = {"index": i, "status": "duplicate", "id": old_id}
                 # Gửi lại email cũ kèm nội dung file đính kèm (vd backfillAttachments) -> bổ sung văn bản file
-                if (old_id and any(att_mod.has_text(a) for a in r["attachments"])
+                if (old_id and any(att_mod.has_text(a) or a.get("_ocr") for a in r["attachments"])
                         and db.merge_attachments(old_id, r["attachments"])):
                     updated += 1
                     res["attachments_updated"] = True

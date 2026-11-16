@@ -247,7 +247,7 @@ def main() -> None:
     tmp = Path(tempfile.mkdtemp())
     db_path = tmp / "zalo.db"
     old_design_db(db_path)
-    env = {**os.environ, "DB_PATH": str(db_path), "MCP_PORT": str(PORT), "MCP_API_KEYS": KEY,
+    env = {**os.environ, "OCR_SPACE_API_KEY": "", "DB_PATH": str(db_path), "MCP_PORT": str(PORT), "MCP_API_KEYS": KEY,
            "PYTHONIOENCODING": "utf-8", "TIMEZONE": "Asia/Ho_Chi_Minh"}
     # Log server ghi ra file (không dùng PIPE: traceback dài của lỗi cố ý sẽ làm đầy pipe và treo server)
     log_path = tmp / "server.log"

@@ -274,14 +274,37 @@ Apps Script gửi nội dung file (base64) cho các định dạng server đọc
 
 | Định dạng | Đọc được |
 |---|---|
-| PDF | Có lớp chữ (xuất từ Word/Excel…). PDF **scan ảnh** báo `không có chữ — cần OCR` |
+| PDF | Có lớp chữ (xuất từ Word/Excel…). PDF **scan ảnh** → OCR (xem dưới) |
 | Word `.docx`, PowerPoint `.pptx` | Đoạn văn + bảng theo đúng thứ tự |
 | Excel `.xlsx` `.xlsm` `.xls` | Từng sheet, mỗi dòng `ô | ô | ô` (giá trị đã tính của công thức), tối đa 5.000 dòng/sheet |
 | CSV, TXT, MD, JSON, XML, HTML | Văn bản |
-| Ảnh, `.doc` / `.ppt` đời cũ, zip… | Chỉ lưu tên file, ghi rõ lý do |
+| Ảnh `.jpg` `.png` `.gif` `.bmp` `.tiff` `.webp` | OCR (xem dưới). Ảnh < 15 KB (logo, chữ ký) bỏ qua |
+| `.doc` / `.ppt` đời cũ, `.heic`, zip… | Chỉ lưu tên file, ghi rõ lý do |
 
 Giới hạn: file > 10 MB (Apps Script, `ATTACHMENT_MAX_BYTES`) hoặc > 15 MB (server) chỉ lưu tên; văn bản mỗi file tối
 đa 60.000 ký tự. Trang quản trị hiện từng file kèm trạng thái đọc và văn bản trích được.
+
+**OCR (PDF scan, ảnh chụp chứng từ)** bằng [OCR.space](https://ocr.space/ocrapi) — bật khi có `OCR_SPACE_API_KEY`
+trong `.env` (để trống = tắt). OCR chạy **nền theo hàng đợi**: mail được lưu ngay, file ở trạng thái
+`đang chờ OCR`, vài giây – vài phút sau có văn bản (tìm kiếm được, Claude đọc được). Nội dung file gốc chỉ giữ tạm
+trong bảng `ocr_queue` tới khi OCR xong; mail bị loại thì xoá luôn. Lưu ý: file được gửi lên máy chủ của OCR.space.
+
+- PDF được coi là scan khi gần như không có lớp chữ (< 30 ký tự/trang); tách thành từng phần `OCR_PDF_PAGES` trang,
+  tối đa `OCR_MAX_PAGES` trang/file. Trang quá lớn: lấy ảnh trong trang, nén rồi OCR.
+- Ảnh lớn hơn `OCR_MAX_BYTES` tự thu nhỏ / nén JPEG.
+- Đếm lượt mỗi ngày, chạm `OCR_DAILY_LIMIT` thì chờ sang ngày sau; OCR.space từ chối (hết lượt / sai key) thì tạm
+  dừng 1 giờ, file vẫn nằm trong hàng đợi. Lỗi khác thử lại 4 lần (2 phút → 4 giờ).
+- Trang **Tổng quan** hiện số file đang chờ OCR và số lượt đã dùng hôm nay.
+
+| Biến `.env` | Mặc định | Ý nghĩa |
+|---|---|---|
+| `OCR_SPACE_API_KEY` | (trống) | Key OCR.space. Trống = tắt OCR |
+| `OCR_ENGINE` | `2` | Engine 2 tự nhận diện tiếng Việt. Engine 3 chính xác hơn, gói miễn phí 1.000 lượt/tháng |
+| `OCR_MAX_BYTES` | `1000000` | Dung lượng tối đa mỗi lần gửi (gói miễn phí 1 MB) |
+| `OCR_PDF_PAGES` | `3` | Số trang PDF mỗi lần gửi (gói miễn phí 3) |
+| `OCR_DAILY_LIMIT` | `450` | Số lượt tối đa mỗi ngày (gói miễn phí 500/ngày/IP) |
+| `OCR_MAX_PAGES` | `30` | Số trang OCR tối đa mỗi file PDF |
+| `OCR_MIN_IMAGE_BYTES` | `15000` | Ảnh nhỏ hơn coi là logo / chữ ký, bỏ qua |
 
 Endpoint dùng chung cho mọi nguồn đẩy dữ liệu khác:
 
@@ -426,7 +449,7 @@ uv run python tests/smoke_test.py
 Lệnh trên chạy kiểm thử đầu-cuối: dựng server HTTP thật trên CSDL tạm và gọi toàn bộ tool. Các kiểm thử khác:
 `tests/flow_test.py` (lọc + hỏi đáp email), `tests/zalo_test.py` (Zalo: thu thập, trả lời, điểm tin), `tests/admin_test.py`,
 `tests/attachments_test.py` (đọc file đính kèm + trang lịch sử trả lời), `tests/zalo_admin_test.py` (cấu hình hội
-thoại Zalo trên trang quản trị).
+thoại Zalo trên trang quản trị), `tests/ocr_test.py` (OCR với server OCR.space giả, không tốn lượt).
 
 Muốn nạp dữ liệu cũ từ file JSON (mảng object cùng cấu trúc với body của `/ingest`):
 
@@ -437,7 +460,6 @@ uv run email-report-mcp import-json du_lieu.json
 ## Hướng nâng cấp
 
 - OAuth thay cho API key trên URL.
-- OCR cho PDF scan / ảnh chụp chứng từ đính kèm (vd qua Google Drive trong Apps Script).
 - Trích xuất có cấu trúc: việc đã làm, kế hoạch, vướng mắc, số liệu KPI.
 - Tìm kiếm ngữ nghĩa bằng embedding.
 - Chuyển CSDL sang PostgreSQL khi có nhiều người dùng.

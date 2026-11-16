@@ -1,9 +1,12 @@
 """Trích văn bản từ file đính kèm email (Apps Script gửi nội dung file dạng base64).
 
 Hỗ trợ: PDF (có lớp chữ), Word .docx, Excel .xlsx/.xlsm/.xls, PowerPoint .pptx, CSV/TXT/MD/JSON/XML, HTML.
+PDF scan (không có lớp chữ) và ảnh (jpg/png/gif/bmp/tiff/webp): OCR bằng OCR.space khi có OCR_SPACE_API_KEY —
+chạy nền (ocr.py), lúc nhận mail chỉ đánh dấu status = ocr_pending.
 Chỉ lưu VĂN BẢN đã trích (không lưu file gốc) vào reports.attachments:
     {name, mime_type, size, status, text, chars, truncated, note}
-status: ok | no_text (vd PDF scan ảnh) | unsupported | too_large | error | name_only (client chỉ gửi tên)
+status: ok | ocr_pending (đang chờ OCR) | no_text (vd PDF scan khi chưa bật OCR) | unsupported | too_large | error
+        | name_only (client chỉ gửi tên). ocr = true nếu văn bản có được nhờ OCR.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ MAX_SHEET_ROWS = 5_000
 
 STATUS_LABEL = {
     "ok": "đã đọc",
+    "ocr_pending": "đang chờ OCR (đọc chữ trong ảnh)",
     "no_text": "không có chữ",
     "unsupported": "định dạng chưa hỗ trợ",
     "too_large": "file quá lớn",
@@ -32,6 +36,8 @@ STATUS_LABEL = {
 }
 
 _TEXT_EXT = {"txt", "csv", "tsv", "md", "json", "xml", "log"}
+_IMAGE_EXT = {"jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp"}
+OCR_MIN_TEXT_PER_PAGE = 30  # PDF trung bình ít hơn số ký tự này mỗi trang = coi là bản scan -> OCR
 _HTML_EXT = {"htm", "html"}
 
 
@@ -188,6 +194,9 @@ def _pptx(data: bytes) -> str:
     return "\n".join(out)
 
 
+_pdf_pages = [0]  # số trang PDF vừa đọc (chỉ dùng ngay trong extract, cùng luồng)
+
+
 def _pdf(data: bytes) -> str:
     from pypdf import PdfReader
 
@@ -199,6 +208,7 @@ def _pdf(data: bytes) -> str:
             raise ValueError("PDF có mật khẩu") from e
     out: list[str] = []
     total = 0
+    _pdf_pages[0] = len(reader.pages)
     for i, page in enumerate(reader.pages):
         if i >= MAX_PDF_PAGES or total > MAX_TEXT_CHARS:
             out.append("…[còn nữa, đã cắt]")
@@ -247,6 +257,8 @@ def _kind(name: str, mime: str) -> str | None:
         return "html"
     if ext in _TEXT_EXT or mime.startswith("text/") or mime in ("application/json", "application/xml"):
         return "text"
+    if ext in _IMAGE_EXT or mime.startswith("image/"):
+        return "image"
     return None
 
 
@@ -265,19 +277,41 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+def _ocr_on() -> bool:
+    from .config import settings
+
+    return bool(settings.ocr_api_key)
+
+
 def extract(name: str, mime: str, data: bytes) -> dict[str, Any]:
-    """Trích văn bản 1 file. Không bao giờ ném lỗi: lỗi được ghi vào status/note."""
+    """Trích văn bản 1 file. Không bao giờ ném lỗi: lỗi được ghi vào status/note.
+    File cần OCR: trả về status=ocr_pending và khoá "_ocr" = nội dung file (db đưa vào hàng đợi, không lưu JSON)."""
+    from .config import settings
+
     kind = _kind(name, mime)
     if kind is None:
         return {"status": "unsupported", "note": f"chưa đọc được định dạng .{_ext(name) or '?'}"}
     if len(data) > MAX_FILE_BYTES:
         return {"status": "too_large", "note": f"file {len(data) // 1024 // 1024} MB, giới hạn "
                                                 f"{MAX_FILE_BYTES // 1024 // 1024} MB"}
+    if kind == "image":
+        if not _ocr_on():
+            return {"status": "unsupported", "note": "ảnh — chưa bật OCR (OCR_SPACE_API_KEY)"}
+        if len(data) < settings.ocr_min_image_bytes:
+            return {"status": "unsupported", "note": "ảnh nhỏ (logo / chữ ký) — bỏ qua OCR"}
+        return {"status": "ocr_pending", "note": "đang chờ OCR", "_ocr": data}
     try:
+        _pdf_pages[0] = 0
         text = _clean(_EXTRACTORS[kind](data))
     except Exception as e:  # noqa: BLE001
         msg = str(e) or e.__class__.__name__
         return {"status": "error", "note": msg[:200]}
+    # PDF scan: không có (hoặc gần như không có) lớp chữ -> OCR
+    if kind == "pdf" and _ocr_on() and len(text) < OCR_MIN_TEXT_PER_PAGE * max(1, _pdf_pages[0]):
+        out: dict[str, Any] = {"status": "ocr_pending", "note": "PDF dạng ảnh scan — đang chờ OCR", "_ocr": data}
+        if text:
+            out.update(text=text, chars=len(text), truncated=False)
+        return out
     if not text:
         note = "PDF không có lớp chữ (ảnh scan) — cần OCR" if kind == "pdf" else "file không có nội dung chữ"
         return {"status": "no_text", "note": note}
@@ -313,6 +347,9 @@ def process(item: Any) -> dict[str, Any]:
         out.update(status="ok", text=text, chars=len(text), truncated=False)
         return out
     skipped = str(item.get("skipped") or "")
+    if skipped == "unsupported" and _kind(name, mime) == "image" and not _ocr_on():
+        out.update(status="unsupported", note="ảnh — chưa bật OCR (OCR_SPACE_API_KEY)")
+        return out
     if skipped == "too_large":
         out.update(status="too_large", note="file quá lớn, Apps Script không gửi nội dung")
     elif skipped == "unsupported" or (skipped == "" and not supported(name, mime)):
@@ -330,5 +367,5 @@ def has_text(att: dict) -> bool:
 
 def describe(att: dict) -> str:
     st = att.get("status") or ("ok" if att.get("text") else "name_only")
-    label = STATUS_LABEL.get(st, st)
+    label = STATUS_LABEL.get(st, st) + (" bằng OCR" if st == "ok" and att.get("ocr") else "")
     return label + (f" — {att['note']}" if att.get("note") and st != "ok" else "")

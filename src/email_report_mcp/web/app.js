@@ -327,7 +327,11 @@ async function viewOverview(root) {
         h("p", { class: "muted small" },
           lastImport ? `Lần nhập gần nhất ${fmtDateTime(lastImport.at)}: +${lastImport.inserted} mới, ${lastImport.duplicate} trùng, ${lastImport.failed} lỗi. `
             : "Chưa có lần nhập nào. ",
-          ov.latest_sent_at ? `Email mới nhất gửi lúc ${fmtDateTime(ov.latest_sent_at)}.` : "")),
+          ov.latest_sent_at ? `Email mới nhất gửi lúc ${fmtDateTime(ov.latest_sent_at)}.` : ""),
+        ov.ocr ? h("p", { class: "muted small" },
+          ov.ocr.enabled
+            ? `OCR file scan / ảnh: ${ov.ocr.queued ? `${ov.ocr.queued} file đang chờ` : "không có file chờ"} · đã dùng ${ov.ocr.used_today}/${ov.ocr.daily_limit} lượt hôm nay${ov.ocr.paused ? " · đang tạm dừng (OCR.space từ chối, thử lại sau 1 giờ)" : ""}.`
+            : "OCR đang tắt — ảnh và PDF scan đính kèm chỉ lưu tên file (đặt OCR_SPACE_API_KEY trong .env để bật).") : null),
       h("div", { class: "panel panel-pad" },
         h("h2", {}, "Kết nối Claude (MCP)"),
         h("p", { class: "muted" }, "Dùng URL này khi thêm Custom connector trên claude.ai / Claude Desktop, nối thêm ?key=<API key>."),
@@ -492,9 +496,12 @@ async function reportDetail(id, onChange) {
       ...(r.attachments || []).map((a) => h("details", { class: "attachment mt", open: (r.attachments.length === 1 && !!a.text) },
         h("summary", {},
           h("strong", {}, a.name),
-          h("span", { class: "badge " + (a.text ? "ok" : a.status === "unsupported" || a.status === "name_only" ? "" : "warn") }, a.read_status || "chỉ có tên file"),
+          h("span", { class: "badge " + (a.status === "ocr_pending" ? "primary" : a.text ? "ok" : a.status === "unsupported" || a.status === "name_only" ? "" : "warn") }, a.read_status || "chỉ có tên file"),
           a.size ? h("span", { class: "muted small" }, `${Math.max(1, Math.round(a.size / 1024))} KB`) : null),
-        a.text ? h("pre", { class: "body-text" }, a.text) : h("p", { class: "muted small" }, "Không có văn bản trích từ file này."))),
+        a.text ? h("pre", { class: "body-text" }, a.text)
+          : h("p", { class: "muted small" }, a.status === "ocr_pending"
+            ? "Trợ lý đang đọc chữ trong file bằng OCR, thường xong sau vài phút — mở lại sau để xem."
+            : "Không có văn bản trích từ file này."))),
     ],
     footer: [
       h("button", { class: "btn danger left", type: "button", onclick: () => deleteReport(r, onChange) }, "Xoá"),

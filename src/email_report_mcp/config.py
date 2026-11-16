@@ -46,5 +46,18 @@ class Settings:
         default_factory=lambda: [int(x) for x in _list("WORK_DAYS", "1,2,3,4,5")]
     )
 
+    # --- OCR file đính kèm (PDF scan, ảnh) bằng OCR.space; để trống key = tắt OCR ---
+    ocr_api_key: str = os.getenv("OCR_SPACE_API_KEY", "").strip()
+    ocr_url: str = os.getenv("OCR_SPACE_URL", "https://api.ocr.space/parse/image")
+    ocr_engine: int = int(os.getenv("OCR_ENGINE", "2"))
+    ocr_language: str = os.getenv("OCR_LANGUAGE", "").strip()       # Engine 2 tự nhận diện ngôn ngữ
+    ocr_max_bytes: int = int(os.getenv("OCR_MAX_BYTES", "1000000"))  # gói miễn phí: 1 MB / lần gửi
+    ocr_pdf_pages: int = int(os.getenv("OCR_PDF_PAGES", "3"))        # gói miễn phí: 3 trang PDF / lần gửi
+    ocr_max_pages: int = int(os.getenv("OCR_MAX_PAGES", "30"))       # tối đa số trang OCR mỗi file
+    ocr_daily_limit: int = int(os.getenv("OCR_DAILY_LIMIT", "450"))  # gói miễn phí: 500 lượt / ngày / IP
+    ocr_min_image_bytes: int = int(os.getenv("OCR_MIN_IMAGE_BYTES", "15000"))  # ảnh nhỏ hơn = logo/chữ ký
+    ocr_timeout: int = int(os.getenv("OCR_TIMEOUT", "120"))
+    ocr_poll_seconds: float = float(os.getenv("OCR_POLL_SECONDS", "10"))
+
 
 settings = Settings()

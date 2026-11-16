@@ -14,7 +14,8 @@
  * (email đã nhập trước khi có tính năng đọc file — chạy nhiều lần tới khi log báo "Đã xong").
  *
  * File đính kèm: script gửi nội dung file (base64) cho các định dạng server đọc được (PDF, Word, Excel,
- * PowerPoint, CSV, TXT...), server trích văn bản để Claude đọc / tìm kiếm. File quá lớn chỉ gửi tên.
+ * PowerPoint, CSV, TXT, ảnh...), server trích văn bản để Claude đọc / tìm kiếm; PDF scan và ảnh được server OCR
+ * (khi bật OCR_SPACE_API_KEY). File quá lớn chỉ gửi tên. Ảnh nhúng trong nội dung mail (logo, chữ ký) không gửi.
  */
 
 const CONFIG = {
@@ -38,7 +39,8 @@ const CONFIG = {
   // Dừng sớm để không vượt giới hạn 6 phút/lần chạy của Apps Script
   MAX_RUNTIME_MS: 4.5 * 60 * 1000,
   // File đính kèm: gửi nội dung các file có đuôi này, mỗi file tối đa ATTACHMENT_MAX_BYTES
-  ATTACHMENT_EXT: /\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|csv|tsv|txt|md|json|xml|html?)$/i,
+  // (ảnh jpg/png/... để server OCR; bỏ ảnh khỏi danh sách nếu không dùng OCR)
+  ATTACHMENT_EXT: /\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|csv|tsv|txt|md|json|xml|html?|jpe?g|png|gif|bmp|tiff?|webp)$/i,
   ATTACHMENT_MAX_BYTES: 10 * 1024 * 1024,
   // Mỗi lần gửi tối đa ~14 MB JSON (nginx nhận tối đa 20 MB; base64 làm file to thêm ~33%)
   REQUEST_MAX_CHARS: 14 * 1024 * 1024,

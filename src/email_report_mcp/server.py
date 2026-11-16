@@ -205,7 +205,8 @@ def get_overview() -> dict:
 @mcp.tool(annotations=READ_ONLY)
 def get_report(report_id: Annotated[int, Field(description="id email")]) -> dict:
     """Xem đầy đủ một email: nội dung, người nhận, CC, phân loại, tóm tắt, luồng và FILE ĐÍNH KÈM — mỗi file có
-    `text` (văn bản đã trích từ PDF/Word/Excel/PowerPoint/CSV) và `read_status` (đã đọc / ảnh scan / chưa hỗ trợ...).
+    `text` (văn bản đã trích từ PDF/Word/Excel/PowerPoint/CSV, hoặc OCR từ PDF scan / ảnh) và `read_status` (đã đọc /
+    đã đọc bằng OCR / đang chờ OCR / chưa hỗ trợ...). File 'đang chờ OCR' thường có văn bản sau vài phút.
     Khi trả lời dựa trên file đính kèm, nêu rõ tên file."""
     r = db.get_report(report_id)
     if not r:
@@ -758,6 +759,9 @@ class RedactKeyFilter(logging.Filter):
 
 def serve() -> None:
     db.init_db()
+    from . import ocr
+
+    ocr.start_worker()
     for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
         logging.getLogger(name).addFilter(RedactKeyFilter())
     if not admin.auth_enabled():

@@ -193,7 +193,7 @@ async def run() -> None:
 
 def main() -> None:
     tmp = Path(tempfile.mkdtemp())
-    env = {**os.environ, "DB_PATH": str(tmp / "flow.db"), "MCP_PORT": str(PORT), "MCP_API_KEYS": KEY,
+    env = {**os.environ, "OCR_SPACE_API_KEY": "", "DB_PATH": str(tmp / "flow.db"), "MCP_PORT": str(PORT), "MCP_API_KEYS": KEY,
            "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen([sys.executable, "-m", "email_report_mcp", "serve"], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

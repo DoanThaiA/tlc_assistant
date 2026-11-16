@@ -22,6 +22,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+os.environ["OCR_SPACE_API_KEY"] = ""  # kiểm thử đọc file không dùng OCR (xem ocr_test.py)
 
 PORT = 8771
 KEY = "att-key"
@@ -248,7 +249,7 @@ async def replies() -> None:
 def main() -> None:
     unit()
     tmp = tempfile.mkdtemp()
-    env = {**os.environ, "MCP_API_KEYS": KEY, "MCP_PORT": str(PORT), "MCP_HOST": "127.0.0.1",
+    env = {**os.environ, "OCR_SPACE_API_KEY": "", "MCP_API_KEYS": KEY, "MCP_PORT": str(PORT), "MCP_HOST": "127.0.0.1",
            "DB_PATH": str(Path(tmp) / "t.db"), "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen([sys.executable, "-m", "email_report_mcp", "serve"], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

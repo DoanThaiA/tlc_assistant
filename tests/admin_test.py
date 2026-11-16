@@ -30,7 +30,7 @@ def check(cond: bool, msg: str) -> None:
 
 def main() -> None:
     tmp = tempfile.mkdtemp()
-    env = {**os.environ, "MCP_API_KEYS": KEY, "ADMIN_PASSWORD": PW, "MCP_PORT": str(PORT),
+    env = {**os.environ, "OCR_SPACE_API_KEY": "", "MCP_API_KEYS": KEY, "ADMIN_PASSWORD": PW, "MCP_PORT": str(PORT),
            "MCP_HOST": "127.0.0.1", "DB_PATH": str(Path(tmp) / "t.db"), "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen([sys.executable, "-m", "email_report_mcp", "serve"], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

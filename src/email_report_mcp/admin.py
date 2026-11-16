@@ -258,8 +258,10 @@ async def me(_: Request) -> Any:
 @api
 async def overview(_: Request) -> Any:
     def work() -> dict:
+        from . import ocr
+
         cp = db.checkpoint()
-        return {"today": db.today(), **db.overview(), "latest_sent_at": cp["latest_sent_at"],
+        return {"today": db.today(), **db.overview(), "latest_sent_at": cp["latest_sent_at"], "ocr": ocr.status(),
                 "recent_imports": cp["recent_imports"], "sources": db.sources(),
                 "category_list": db.categories()}
     return await _run(work)
