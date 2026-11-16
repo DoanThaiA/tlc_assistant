@@ -439,14 +439,16 @@ def _index_fts(conn: sqlite3.Connection, rid: int) -> None:
     r = conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
     if not r or r["status"] == "discarded":
         return
-    att = " ".join(a.get("name", "") for a in json.loads(r["attachments"] or "[]"))
+    atts = json.loads(r["attachments"] or "[]")
+    att = " ".join(a.get("name", "") for a in atts)
+    att_text = "\n".join(a["text"] for a in atts if a.get("text"))
     conn.execute(
         "INSERT INTO reports_fts(rowid, subject, body, sender) VALUES (?,?,?,?)",
         (
             rid,
             norm(" ".join(filter(None, [r["subject"], att, (r["tags"] or "").replace(",", " "),
                                         (r["category"] or "").replace("_", " ")]))),
-            norm(" ".join(filter(None, [r["summary"], r["body_text"]]))),
+            norm(" ".join(filter(None, [r["summary"], r["body_text"], att_text]))),
             norm(f"{r['sender_name'] or ''} {r['sender_email']}"),
         ),
     )
@@ -490,6 +492,46 @@ def insert_report(r: dict[str, Any]) -> int | None:
         rid = cur.lastrowid
         _index_fts(conn, rid)
         return rid
+
+
+def merge_attachments(rid: int, new: list[dict]) -> bool:
+    """Bổ sung văn bản file đính kèm cho email đã có (email gửi lại kèm nội dung file).
+    Chỉ thay file chưa có văn bản; email đã loại thì bỏ qua. Trả về True nếu có thay đổi."""
+    with connect() as conn:
+        row = conn.execute("SELECT status, attachments FROM reports WHERE id=?", (rid,)).fetchone()
+        if not row or row["status"] == "discarded":
+            return False
+        old = json.loads(row["attachments"] or "[]")
+        changed = False
+        for a in new:
+            if not a.get("text"):
+                continue
+            same = next((o for o in old if o.get("name") == a.get("name") and not o.get("text")), None)
+            if same is not None:
+                old[old.index(same)] = a
+                changed = True
+            elif not any(o.get("name") == a.get("name") for o in old):
+                old.append(a)
+                changed = True
+        if changed:
+            conn.execute("UPDATE reports SET attachments=? WHERE id=?", (json.dumps(old, ensure_ascii=False), rid))
+            _index_fts(conn, rid)
+        return changed
+
+
+def _att_brief(atts: list[dict], max_chars: int) -> list[dict]:
+    """Đính kèm rút gọn cho danh sách: tên, trạng thái đọc, văn bản (cắt bớt)."""
+    from .attachments import describe
+
+    out = []
+    for a in atts:
+        d: dict[str, Any] = {"name": a.get("name"), "read_status": describe(a)}
+        text = a.get("text") or ""
+        if text:
+            d["text"] = text if len(text) <= max_chars else text[:max_chars] + "\n…[đã cắt, xem đủ bằng get_report]"
+            d["text_length"] = len(text)
+        out.append(d)
+    return out
 
 
 def find_by_message_id(message_id: str) -> int | None:
@@ -757,7 +799,14 @@ def get_report(report_id: int) -> dict | None:
             f"r.sender_name, r.created_at, r.labels, r.reviewed_at, r.review_note {_JOIN} WHERE r.id = ?",
             (report_id,),
         ).fetchone()
-    return _out(row) if row else None
+    if not row:
+        return None
+    d = _out(row)
+    from .attachments import describe
+
+    for a in d.get("attachments") or []:
+        a["read_status"] = describe(a)
+    return d
 
 
 def reports_full(
@@ -783,7 +832,7 @@ def reports_full(
         body = d.get("body_text") or ""
         if len(body) > max_chars_each:
             d["body_text"] = body[:max_chars_each] + f"\n…[đã cắt, xem đủ bằng get_report id={d['id']}]"
-        d["attachments"] = [a["name"] for a in d["attachments"]]
+        d["attachments"] = _att_brief(d["attachments"], max_chars_each)
         out.append(d)
     return {"total_matching": total, "reports": out}
 
@@ -836,6 +885,20 @@ def _snippet(text: str, tokens: list[str], width: int = 160) -> str:
     return ("…" if start > 0 else "") + s + ("…" if end < len(text) else "")
 
 
+def _has_token(text: str, tokens: list[str]) -> bool:
+    ntext = norm(nfc(text))
+    return any(re.search(r"\b" + re.escape(t), ntext) for t in tokens)
+
+
+def _search_snippet(body: str, atts_json: str | None, tokens: list[str]) -> tuple[str, str | None]:
+    """Đoạn trích quanh từ khoá: ưu tiên nội dung email, không có thì tìm trong văn bản file đính kèm."""
+    if not _has_token(body, tokens):
+        for a in json.loads(atts_json or "[]"):
+            if a.get("text") and _has_token(a["text"], tokens):
+                return f"[Đính kèm {a.get('name')}] " + _snippet(a["text"], tokens), a.get("name")
+    return _snippet(body, tokens), None
+
+
 def search_reports(
     query: str,
     date_from: str | None = None,
@@ -865,7 +928,8 @@ def search_reports(
         with connect() as conn:
             total = conn.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
             rows = conn.execute(
-                f"SELECT {_REPORT_COLS}, r.body_text, bm25(reports_fts, 5.0, 1.0, 2.0) AS score {base} "
+                f"SELECT {_REPORT_COLS}, r.body_text, r.attachments AS att_json, "
+                f"bm25(reports_fts, 5.0, 1.0, 2.0) AS score {base} "
                 f"ORDER BY {order} LIMIT ?", [*params, limit]).fetchall()
         return total, rows
 
@@ -878,7 +942,9 @@ def search_reports(
     results = []
     for row in rows:
         d = _out(row)
-        d["snippet"] = _snippet(d.pop("body_text") or "", tokens)
+        d["snippet"], in_att = _search_snippet(d.pop("body_text") or "", d.pop("att_json"), tokens)
+        if in_att:
+            d["matched_in_attachment"] = in_att
         d.pop("score", None)
         results.append(d)
     return {"query": query, "match_mode": mode, "total_matching": total, "count": len(results), "results": results}
@@ -1104,7 +1170,7 @@ def pending_emails(limit: int = 20, max_chars_each: int = 2000) -> dict:
         body = d.pop("body_text") or ""
         d["body"] = body if len(body) <= max_chars_each else body[:max_chars_each] + "\n…[đã cắt]"
         d["body_length"] = len(body)
-        d["attachments"] = [a["name"] for a in d["attachments"]]
+        d["attachments"] = _att_brief(d["attachments"], min(1500, max_chars_each))
         d["is_employee"] = d["employee_name"] is not None
         emails.append(d)
     return {"total_pending": total, "returned": len(emails), "emails": emails}

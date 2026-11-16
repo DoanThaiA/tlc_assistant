@@ -5,6 +5,8 @@ MCP server (FastMCP, transport **HTTP**) làm trợ lý thông tin cho CEO với
 **1. Theo dõi email báo cáo gửi đến**
 - **Lấy mail:** Google Apps Script trong tài khoản Gmail cứ vài phút đẩy mail mới sang `POST /ingest`.
   Email vào trạng thái **chờ duyệt** (`pending`). Xem [Tự động lấy mail từ Gmail](#tự-động-lấy-mail-từ-gmail-apps-script).
+- **File đính kèm:** Apps Script gửi kèm nội dung file, server trích văn bản (PDF, Word, Excel, PowerPoint, CSV…) để
+  Claude đọc, tóm tắt và tìm kiếm như nội dung email. Xem [File đính kèm](#file-đính-kèm).
 - **Lọc:** mỗi lượt định kỳ Claude gọi `get_pending_emails` → giữ/loại theo **quy tắc lọc** → `review_emails`.
   Email giữ lại (`kept`) có nhóm, tóm tắt, tag; email loại (`discarded`) bị xoá nội dung. Có thể duyệt tay trên trang quản trị.
 
@@ -152,7 +154,7 @@ Cùng một server, cùng domain:
 
 | URL | Dùng cho |
 |---|---|
-| `https://<domain>/` | Giao diện quản trị: tổng quan, ai chưa nộp, xem/thêm/sửa/xoá báo cáo, quản lý nhân viên, nhập CSV, nhật ký nhập |
+| `https://<domain>/` | Giao diện quản trị: tổng quan, ai chưa nộp, xem/thêm/sửa/xoá báo cáo (kèm văn bản file đính kèm), **lịch sử trả lời của trợ lý**, quản lý nhân viên, nhập CSV, nhật ký nhập |
 | `https://<domain>/mcp` | MCP cho Claude (cần API key) |
 | `https://<domain>/api/*` | REST API của giao diện |
 | `https://<domain>/ingest` | Apps Script đẩy mail |
@@ -175,8 +177,15 @@ Sai mật khẩu 10 lần trong 10 phút thì IP đó bị khoá tạm.
 | `GET /api/reports?status=pending` · `POST /api/reports/review` `{decisions}` · `GET /api/reports/{id}/thread` | Chờ duyệt, duyệt giữ/loại, xem luồng |
 | `GET/PUT /api/rules` `{filter_rules, categories}` | Quy tắc lọc và danh mục phân loại |
 | `POST /api/reports/purge-discarded` `{older_than_days}` | Dọn dấu vết email đã loại |
+| `GET /api/replies?q=&conversation_id=&status=&asker=&date_from=&date_to=&limit=&offset=` · `GET /api/replies/{id}` | Lịch sử câu hỏi / câu trả lời của trợ lý trên Zalo, chi tiết kèm email / tin Zalo nguồn |
+| `GET /api/replies/stats?date_from=&date_to=` · `GET /api/zalo/conversations` | Thống kê trả lời (theo trạng thái, ngày, hội thoại, người hỏi, thời gian phản hồi) |
 
-Kiểm thử: `uv run python tests/admin_test.py`.
+**Tab "Trợ lý trả lời"** (`/#/replies`): mỗi câu hỏi trợ lý nhận trên Zalo — ai hỏi, ở hội thoại nào, lúc nào, trợ lý
+trả lời gì (nguyên văn), sau bao lâu, dựa trên email / tin Zalo nào, hoặc vì sao bỏ qua. Có thẻ tổng hợp (số câu hỏi,
+đã trả lời, bỏ qua, thời gian phản hồi trung vị), biểu đồ theo ngày (bấm cột để lọc ngày đó), thống kê theo hội thoại
+và người hỏi, tìm không dấu trong câu hỏi / câu trả lời. Câu "Dở dang" = trợ lý đã nhận quá 30 phút mà chưa ghi kết quả.
+
+Kiểm thử: `uv run python tests/admin_test.py`, `uv run python tests/attachments_test.py`.
 
 ## Kết nối Claude
 
@@ -222,16 +231,41 @@ Cách script chạy:
 - Mỗi email trong một luồng được lưu riêng, kèm `thread_id` để `get_thread` ghép lại cuộc trao đổi.
 - Bỏ qua email do chính tài khoản này gửi (`EXCLUDE_SELF`). Luồng đã gửi sang server được gắn nhãn `MCP/Đã gửi`.
 - Nếu server lỗi, mốc không bị đẩy lên nên lượt sau gửi lại, và Google sẽ email thông báo lỗi.
+- File đính kèm được gửi kèm nội dung (xem [File đính kèm](#file-đính-kèm)); mỗi lần gửi tối đa ~14 MB nên lô có
+  file lớn tự chia nhỏ.
 
 Các hàm khác:
 
 - `testConnection`: kiểm tra URL và key.
 - `resetCheckpoint`: quét lại từ đầu; server tự bỏ email trùng.
+- `backfillAttachments`: gửi lại nội dung file đính kèm của email **đã nhập trước đây** (mặc định 30 ngày,
+  `BACKFILL_DAYS`). Server chỉ bổ sung văn bản file cho email đã có, không tạo trùng, bỏ qua email đã loại. Mỗi lần chạy
+  ~4,5 phút; chạy lại tới khi log báo `Đã xong`. `resetBackfill` để quét lại từ đầu.
 - `removeTriggers`: dừng tự động.
+
+**Cập nhật script cũ:** dán đè toàn bộ `Code.gs` mới, lưu, rồi chạy `backfillAttachments` (không cần chạy lại `setup`,
+trigger cũ tự dùng code mới).
 
 **Giới hạn của Google:** tổng thời gian chạy trigger mỗi ngày là 90 phút với Gmail cá nhân, 6 giờ với Google Workspace.
 Quét mỗi 1 phút tốn khoảng 30–50 phút/ngày. Với Gmail cá nhân nên đặt `TRIGGER_MINUTES: 5` cho an toàn,
 rồi chạy lại `setup`.
+
+### File đính kèm
+
+Apps Script gửi nội dung file (base64) cho các định dạng server đọc được; server trích **văn bản** rồi lưu vào email
+(không lưu file gốc). Văn bản file được đưa vào tìm kiếm toàn văn, `get_pending_emails` (đoạn đầu, để lọc),
+`get_report` (đầy đủ), `get_reports_content`, `search_reports` (đoạn trích ghi rõ `[Đính kèm tên-file]`).
+
+| Định dạng | Đọc được |
+|---|---|
+| PDF | Có lớp chữ (xuất từ Word/Excel…). PDF **scan ảnh** báo `không có chữ — cần OCR` |
+| Word `.docx`, PowerPoint `.pptx` | Đoạn văn + bảng theo đúng thứ tự |
+| Excel `.xlsx` `.xlsm` `.xls` | Từng sheet, mỗi dòng `ô | ô | ô` (giá trị đã tính của công thức), tối đa 5.000 dòng/sheet |
+| CSV, TXT, MD, JSON, XML, HTML | Văn bản |
+| Ảnh, `.doc` / `.ppt` đời cũ, zip… | Chỉ lưu tên file, ghi rõ lý do |
+
+Giới hạn: file > 10 MB (Apps Script, `ATTACHMENT_MAX_BYTES`) hoặc > 15 MB (server) chỉ lưu tên; văn bản mỗi file tối
+đa 60.000 ký tự. Trang quản trị hiện từng file kèm trạng thái đọc và văn bản trích được.
 
 Endpoint dùng chung cho mọi nguồn đẩy dữ liệu khác:
 
@@ -240,6 +274,10 @@ POST /ingest
 Authorization: Bearer <API_KEY>
 {"source": "gmail", "reports": [ { sender_email, sender_name, subject, body, sent_at, message_id, thread_id, attachments... } ]}
 ```
+
+`attachments`: danh sách tên file, hoặc object `{name, mime_type, size, data}` (`data` = base64) /
+`{name, text}` (văn bản tự trích) / `{name, skipped: "too_large"}`. Gửi lại email đã có (cùng `message_id`) kèm nội
+dung file thì server bổ sung văn bản file (`attachments_updated` trong kết quả).
 
 ## Tác vụ định kỳ 15 phút
 
@@ -369,7 +407,8 @@ uv run python tests/smoke_test.py
 ```
 
 Lệnh trên chạy kiểm thử đầu-cuối: dựng server HTTP thật trên CSDL tạm và gọi toàn bộ tool. Các kiểm thử khác:
-`tests/flow_test.py` (lọc + hỏi đáp email), `tests/zalo_test.py` (Zalo: thu thập, trả lời, điểm tin), `tests/admin_test.py`.
+`tests/flow_test.py` (lọc + hỏi đáp email), `tests/zalo_test.py` (Zalo: thu thập, trả lời, điểm tin), `tests/admin_test.py`,
+`tests/attachments_test.py` (đọc file đính kèm + trang lịch sử trả lời).
 
 Muốn nạp dữ liệu cũ từ file JSON (mảng object cùng cấu trúc với body của `/ingest`):
 
@@ -380,7 +419,7 @@ uv run email-report-mcp import-json du_lieu.json
 ## Hướng nâng cấp
 
 - OAuth thay cho API key trên URL.
-- Đọc nội dung file đính kèm (xlsx/docx/pdf).
+- OCR cho PDF scan / ảnh chụp chứng từ đính kèm (vd qua Google Drive trong Apps Script).
 - Trích xuất có cấu trúc: việc đã làm, kế hoạch, vướng mắc, số liệu KPI.
 - Tìm kiếm ngữ nghĩa bằng embedding.
 - Chuyển CSDL sang PostgreSQL khi có nhiều người dùng.

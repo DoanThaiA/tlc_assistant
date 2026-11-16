@@ -621,3 +621,140 @@ def briefing(date_from: str | None = None, date_to: str | None = None, important
         "pending_emails": db.overview()["pending"],
         "zalo_last_scanned_at": summary()["last_scanned_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Trang quản trị: lịch sử trả lời của trợ lý trên Zalo
+# ---------------------------------------------------------------------------
+_ASKED_DAY = "substr(COALESCE(r.asked_at, r.created_at),1,10)"
+REPLY_STATUSES = ("claimed", "sent", "skipped")
+
+
+def _reply_where(conversation_id: int | None, status: str | None, q: str | None, date_from: str | None,
+                 date_to: str | None, asker: str | None = None) -> tuple[str, list[Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    if conversation_id:
+        where.append("r.conversation_id = ?")
+        params.append(int(conversation_id))
+    if status:
+        if status not in REPLY_STATUSES:
+            raise ValueError(f"status phải là một trong {REPLY_STATUSES}")
+        where.append("r.status = ?")
+        params.append(status)
+    df = db._check_date(date_from, "date_from")
+    dt = db._check_date(date_to, "date_to")
+    if df:
+        where.append(f"{_ASKED_DAY} >= ?")
+        params.append(df)
+    if dt:
+        where.append(f"{_ASKED_DAY} <= ?")
+        params.append(dt)
+    if asker:
+        where.append("norm(COALESCE(r.asker,'')) LIKE ?")
+        params.append(f"%{norm(asker.strip())}%")
+    for word in re.findall(r"\w+", norm(q or "")):
+        where.append("norm(r.question || ' ' || COALESCE(r.reply_text,'') || ' ' || COALESCE(r.asker,'') || ' ' "
+                     "|| COALESCE(r.note,'')) LIKE ?")
+        params.append(f"%{word}%")
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def _response_minutes(asked: str | None, created: str | None, replied: str | None) -> float | None:
+    start = asked or created
+    if not start or not replied:
+        return None
+    try:
+        return round((datetime.fromisoformat(replied) - datetime.fromisoformat(start)).total_seconds() / 60, 1)
+    except ValueError:
+        return None
+
+
+def admin_replies(conversation_id: int | None = None, status: str | None = None, q: str | None = None,
+                  date_from: str | None = None, date_to: str | None = None, asker: str | None = None,
+                  limit: int = 50, offset: int = 0) -> dict:
+    w, params = _reply_where(conversation_id, status, q, date_from, date_to, asker)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    with connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM zalo_replies r{w}", params).fetchone()[0]
+        rows = conn.execute(
+            "SELECT r.id, r.conversation_id, c.name AS conversation, c.kind, r.asker, r.asked_at, r.question, "
+            "r.status, r.reply_text, r.note, r.created_at, r.replied_at, r.source_report_ids, r.source_zalo_ids "
+            f"FROM zalo_replies r JOIN zalo_conversations c ON c.id = r.conversation_id{w} "
+            "ORDER BY COALESCE(r.asked_at, r.created_at) DESC, r.id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset]).fetchall()
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["sources"] = len(json.loads(d.pop("source_report_ids") or "[]")) + \
+            len(json.loads(d.pop("source_zalo_ids") or "[]"))
+        d["response_minutes"] = _response_minutes(d["asked_at"], d["created_at"], d["replied_at"])
+        d["stale"] = d["status"] == "claimed" and d["created_at"] < _iso(
+            _now_dt() - timedelta(minutes=CLAIM_TIMEOUT_MINUTES))
+        items.append(d)
+    return {"total": total, "offset": offset, "count": len(items), "replies": items}
+
+
+def reply_detail(reply_id: int) -> dict | None:
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT r.*, c.name AS conversation, c.kind FROM zalo_replies r "
+            "JOIN zalo_conversations c ON c.id = r.conversation_id WHERE r.id = ?", (reply_id,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        rids = json.loads(d.pop("source_report_ids") or "[]")
+        zids = json.loads(d.pop("source_zalo_ids") or "[]")
+        d["source_reports"] = []
+        if rids:
+            marks = ",".join("?" * len(rids))
+            found = {x["id"]: dict(x) for x in conn.execute(
+                "SELECT r.id, r.report_date, r.subject, r.status, r.summary, "
+                "COALESCE(e.name, r.sender_name, r.sender_email) AS employee_name "
+                f"FROM reports r LEFT JOIN employees e ON e.email = r.sender_email WHERE r.id IN ({marks})", rids)}
+            d["source_reports"] = [found.get(i) or {"id": i, "missing": True} for i in rids]
+        d["source_zalo"] = []
+        if zids:
+            marks = ",".join("?" * len(zids))
+            found = {x["id"]: dict(x) for x in conn.execute(
+                "SELECT m.id, c.name AS conversation, m.sender, m.sent_at, m.summary, substr(m.text,1,500) AS text "
+                f"FROM zalo_messages m JOIN zalo_conversations c ON c.id = m.conversation_id WHERE m.id IN ({marks})",
+                zids)}
+            d["source_zalo"] = [found.get(i) or {"id": i, "missing": True} for i in zids]
+    d["response_minutes"] = _response_minutes(d["asked_at"], d["created_at"], d["replied_at"])
+    return d
+
+
+def reply_stats(date_from: str, date_to: str) -> dict:
+    w, params = _reply_where(None, None, None, date_from, date_to)
+    with connect() as conn:
+        by_status = {s: 0 for s in REPLY_STATUSES}
+        for row in conn.execute(f"SELECT r.status, COUNT(*) FROM zalo_replies r{w} GROUP BY r.status", params):
+            by_status[row[0]] = row[1]
+        per_day = [dict(x) for x in conn.execute(
+            f"SELECT {_ASKED_DAY} AS day, SUM(r.status='sent') AS sent, SUM(r.status='skipped') AS skipped, "
+            f"SUM(r.status='claimed') AS claimed FROM zalo_replies r{w} GROUP BY day ORDER BY day", params)]
+        by_conv = [dict(x) for x in conn.execute(
+            "SELECT c.id, c.name, c.kind, COUNT(*) AS total, SUM(r.status='sent') AS sent, "
+            "SUM(r.status='skipped') AS skipped, MAX(COALESCE(r.asked_at, r.created_at)) AS last_at "
+            f"FROM zalo_replies r JOIN zalo_conversations c ON c.id = r.conversation_id{w} "
+            "GROUP BY c.id ORDER BY total DESC", params)]
+        askers = [dict(x) for x in conn.execute(
+            f"SELECT COALESCE(r.asker,'(không rõ)') AS asker, COUNT(*) AS total, SUM(r.status='sent') AS sent "
+            f"FROM zalo_replies r{w} GROUP BY COALESCE(r.asker,'(không rõ)') ORDER BY total DESC LIMIT 10", params)]
+        times = [_response_minutes(a, c, rp) for a, c, rp in conn.execute(
+            f"SELECT r.asked_at, r.created_at, r.replied_at FROM zalo_replies r{w}"
+            + (" AND" if w else " WHERE") + " r.status='sent'", params)]
+    times = sorted(t for t in times if t is not None and t >= 0)
+    median = None
+    if times:
+        mid = len(times) // 2
+        median = times[mid] if len(times) % 2 else round((times[mid - 1] + times[mid]) / 2, 1)
+    return {
+        "date_from": date_from, "date_to": date_to,
+        "total": sum(by_status.values()), "by_status": by_status,
+        "response_minutes": {"avg": round(sum(times) / len(times), 1) if times else None, "median": median,
+                             "max": times[-1] if times else None, "count": len(times)},
+        "per_day": per_day, "by_conversation": by_conv, "top_askers": askers,
+    }

@@ -9,6 +9,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from . import attachments as att_mod
 from . import db
 from .config import settings
 
@@ -131,10 +132,7 @@ def normalize(item: dict[str, Any], source: str | None) -> dict[str, Any]:
         key = f"{sender_email}|{sent_dt.isoformat()}|{db.norm(subject)}"
         message_id = "gen:" + hashlib.sha1(key.encode("utf-8")).hexdigest()
 
-    attachments = [
-        {"name": str(a)} if not isinstance(a, dict) else {"name": a.get("name", "(không tên)"), **a}
-        for a in (item.get("attachments") or [])
-    ]
+    attachments = [att_mod.process(a) for a in (item.get("attachments") or [])]
     return {
         "message_id": message_id,
         "source": source,
@@ -164,7 +162,7 @@ def save_batch(items: list[dict[str, Any]], source: str | None, status: str = "k
     if len(items) > MAX_BATCH:
         raise ValueError(f"Tối đa {MAX_BATCH} báo cáo mỗi lần gửi, hãy chia nhỏ lô.")
     results: list[dict[str, Any]] = []
-    inserted = duplicate = failed = 0
+    inserted = duplicate = failed = updated = 0
     for i, item in enumerate(items):
         try:
             r = normalize(item, source)
@@ -180,11 +178,18 @@ def save_batch(items: list[dict[str, Any]], source: str | None, status: str = "k
                                 "review_status": status})
             else:
                 duplicate += 1
-                results.append({"index": i, "status": "duplicate", "id": db.find_by_message_id(r["message_id"])})
+                old_id = db.find_by_message_id(r["message_id"])
+                res: dict[str, Any] = {"index": i, "status": "duplicate", "id": old_id}
+                # Gửi lại email cũ kèm nội dung file đính kèm (vd backfillAttachments) -> bổ sung văn bản file
+                if (old_id and any(att_mod.has_text(a) for a in r["attachments"])
+                        and db.merge_attachments(old_id, r["attachments"])):
+                    updated += 1
+                    res["attachments_updated"] = True
+                results.append(res)
         except Exception as e:  # noqa: BLE001
             failed += 1
             results.append({"index": i, "status": "error", "error": str(e)})
     if items:
         db.log_import(source, len(items), inserted, duplicate, failed)
     return {"received": len(items), "inserted": inserted, "duplicate": duplicate, "failed": failed,
-            "results": results}
+            "attachments_updated": updated, "results": results}

@@ -22,7 +22,7 @@ import anyio
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from . import db, ingest
+from . import db, ingest, zalo
 from .config import settings
 
 COOKIE = "erm_session"
@@ -463,6 +463,38 @@ async def employees_import(request: Request) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Lịch sử trả lời của trợ lý (Zalo)
+# ---------------------------------------------------------------------------
+@api
+async def replies_list(request: Request) -> Any:
+    return await _run(lambda: zalo.admin_replies(
+        _int(request, "conversation_id", 0) or None, _q(request, "status"), _q(request, "q"),
+        _q(request, "date_from"), _q(request, "date_to"), _q(request, "asker"),
+        _int(request, "limit", 50), _int(request, "offset", 0)))
+
+
+@api
+async def replies_stats(request: Request) -> Any:
+    today = date.fromisoformat(db.today())
+    df = _q(request, "date_from") or (today - timedelta(days=13)).isoformat()
+    dt = _q(request, "date_to") or today.isoformat()
+    return await _run(zalo.reply_stats, df, dt)
+
+
+@api
+async def reply_get(request: Request) -> Any:
+    r = await _run(zalo.reply_detail, int(request.path_params["id"]))
+    if not r:
+        raise NotFound("Không tìm thấy câu hỏi")
+    return r
+
+
+@api
+async def zalo_conversations(_: Request) -> Any:
+    return {"conversations": await _run(zalo.list_conversations)}
+
+
+# ---------------------------------------------------------------------------
 def register(mcp: Any) -> None:
     route = mcp.custom_route
     route("/", methods=["GET"])(index)
@@ -485,6 +517,10 @@ def register(mcp: Any) -> None:
     route("/api/reports/{id:int}", methods=["GET"])(report_get)
     route("/api/reports/{id:int}", methods=["PUT"])(report_update)
     route("/api/reports/{id:int}", methods=["DELETE"])(report_delete)
+    route("/api/replies", methods=["GET"])(replies_list)
+    route("/api/replies/stats", methods=["GET"])(replies_stats)
+    route("/api/replies/{id:int}", methods=["GET"])(reply_get)
+    route("/api/zalo/conversations", methods=["GET"])(zalo_conversations)
     route("/api/employees", methods=["GET"])(employees_list)
     route("/api/employees", methods=["POST"])(employee_create)
     route("/api/employees/import", methods=["POST"])(employees_import)

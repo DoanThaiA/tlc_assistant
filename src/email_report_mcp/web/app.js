@@ -204,7 +204,7 @@ $("#logout").addEventListener("click", async () => {
 /* ------------------------------------------------------------------ */
 const views = {
   overview: viewOverview, pending: viewPending, reports: viewReports, employees: viewEmployees,
-  rules: viewRules, imports: viewImports,
+  rules: viewRules, imports: viewImports, replies: viewReplies,
 };
 
 function route() {
@@ -484,11 +484,17 @@ async function reportDetail(id, onChange) {
         row("Gửi lúc", fmtDateTime(r.sent_at)),
         row("Người nhận", r.to_addrs),
         row("CC", r.cc_addrs),
-        row("Đính kèm", (r.attachments || []).map((a) => a.name).join(", ")),
+        row("Đính kèm", (r.attachments || []).length ? `${r.attachments.length} file (xem bên dưới)` : null),
         row("Nhãn Gmail", r.labels),
         row("Nguồn", r.source),
         row("Mã", `#${r.id}`)),
       h("pre", { class: "body-text" }, r.body_text || "(trống)"),
+      ...(r.attachments || []).map((a) => h("details", { class: "attachment mt", open: (r.attachments.length === 1 && !!a.text) },
+        h("summary", {},
+          h("strong", {}, a.name),
+          h("span", { class: "badge " + (a.text ? "ok" : a.status === "unsupported" || a.status === "name_only" ? "" : "warn") }, a.read_status || "chỉ có tên file"),
+          a.size ? h("span", { class: "muted small" }, `${Math.max(1, Math.round(a.size / 1024))} KB`) : null),
+        a.text ? h("pre", { class: "body-text" }, a.text) : h("p", { class: "muted small" }, "Không có văn bản trích từ file này."))),
     ],
     footer: [
       h("button", { class: "btn danger left", type: "button", onclick: () => deleteReport(r, onChange) }, "Xoá"),
@@ -821,3 +827,191 @@ async function viewRules(root) {
 }
 
 boot();
+
+/* ------------------------------------------------------------------ */
+/* LỊCH SỬ TRẢ LỜI CỦA TRỢ LÝ (Zalo)                                   */
+/* ------------------------------------------------------------------ */
+const REPLY_LABEL = { sent: "Đã trả lời", skipped: "Bỏ qua", claimed: "Đang soạn" };
+const REPLY_BADGE = { sent: "ok", skipped: "warn", claimed: "primary" };
+const replyFilter = { q: "", conversation_id: "", status: "", asker: "", date_from: "", date_to: "", offset: 0, limit: 50 };
+
+function fmtMinutes(m) {
+  if (m == null) return "—";
+  if (m < 1) return "< 1 phút";
+  if (m < 60) return `${Math.round(m)} phút`;
+  const hrs = Math.floor(m / 60);
+  const mins = Math.round(m % 60);
+  return mins ? `${hrs} giờ ${mins} phút` : `${hrs} giờ`;
+}
+function replyBadge(r) {
+  if (r.status === "claimed" && r.stale) return h("span", { class: "badge danger", title: "Đã nhận nhưng chưa ghi kết quả quá 30 phút" }, "Dở dang");
+  return h("span", { class: "badge " + (REPLY_BADGE[r.status] || "") }, REPLY_LABEL[r.status] || r.status);
+}
+const clip = (s, n = 160) => (s && s.length > n ? s.slice(0, n).trimEnd() + "…" : s || "");
+
+async function viewReplies(root) {
+  const f = replyFilter;
+  const today = state.me.today;
+  const convs = (await api("GET", "/api/zalo/conversations")).conversations;
+  const statsBox = h("div", {});
+  const tableBox = h("div", { class: "table-wrap" });
+  const pager = h("div", { class: "pager" });
+  const set = (k) => (e) => { f[k] = e.target.value; f.offset = 0; reload(); };
+
+  const toolbar = h("div", { class: "toolbar" },
+    h("label", { class: "field grow" }, "Tìm câu hỏi / câu trả lời (không cần dấu)",
+      h("input", { type: "search", value: f.q, placeholder: "vd: doanh so, chua nop…", oninput: debounce(set("q")) })),
+    h("label", { class: "field" }, "Hội thoại",
+      h("select", { onchange: set("conversation_id") }, h("option", { value: "" }, "Tất cả"),
+        convs.map((c) => h("option", { value: c.id, selected: String(c.id) === String(f.conversation_id) }, c.name)))),
+    h("label", { class: "field" }, "Người hỏi",
+      h("input", { type: "search", value: f.asker, placeholder: "tên", oninput: debounce(set("asker")) })),
+    h("label", { class: "field" }, "Trạng thái",
+      h("select", { onchange: set("status") }, h("option", { value: "" }, "Tất cả"),
+        Object.entries(REPLY_LABEL).map(([v, l]) => h("option", { value: v, selected: v === f.status }, l)))),
+    h("label", { class: "field" }, "Từ ngày", h("input", { type: "date", value: f.date_from, max: today, onchange: set("date_from") })),
+    h("label", { class: "field" }, "Đến ngày", h("input", { type: "date", value: f.date_to, max: today, onchange: set("date_to") })),
+    h("button", { class: "btn", type: "button", onclick: () => {
+      Object.assign(f, { q: "", conversation_id: "", status: "", asker: "", date_from: "", date_to: "", offset: 0 });
+      route();
+    } }, "Xoá lọc"));
+
+  root.append(
+    h("div", { class: "page-head" }, h("h1", {}, "Lịch sử trả lời của trợ lý"),
+      h("div", { class: "muted" }, "Câu hỏi trên Zalo (CEO nhắn riêng, nhóm trợ lý) và câu trả lời trợ lý đã gửi")),
+    statsBox,
+    h("div", { class: "spacer" }),
+    h("div", { class: "panel" }, toolbar, tableBox, pager));
+
+  async function loadStats() {
+    const dt = f.date_to || today;
+    const df = f.date_from || addDays(dt, -13);
+    const st = await api("GET", "/api/replies/stats" + qs({ date_from: df, date_to: dt }));
+    const card = (label, value, sub) => h("div", { class: "panel panel-pad card" },
+      h("div", { class: "label" }, label), h("div", { class: "value" + (String(value).length > 8 ? " sm" : "") }, value),
+      sub ? h("div", { class: "sub" }, sub) : null);
+    const rt = st.response_minutes;
+
+    // Biểu đồ theo ngày (tối đa 31 ngày cuối của khoảng)
+    const perDay = Object.fromEntries(st.per_day.map((d) => [d.day, d]));
+    const days = [];
+    for (let d = dt, i = 0; d >= df && i < 31; d = addDays(d, -1), i++) days.unshift(d);
+    const total = (x) => (x ? x.sent + x.skipped + x.claimed : 0);
+    const max = Math.max(1, ...days.map((d) => total(perDay[d])));
+    const bars = h("div", { class: "bars" }, days.map((d) => {
+      const x = perDay[d] || { sent: 0, skipped: 0, claimed: 0 };
+      const n = total(x);
+      const seg = (v, cls) => {
+        if (!v) return null;
+        const s = h("div", { class: "seg " + cls });
+        s.style.height = `${(v / n) * 100}%`;
+        return s;
+      };
+      const stack = h("div", { class: "stack" + (n ? "" : " zero"),
+        title: `${fmtDate(d)}: ${x.sent} đã trả lời, ${x.skipped} bỏ qua${x.claimed ? `, ${x.claimed} đang soạn` : ""}` },
+      seg(x.claimed, "primary"), seg(x.skipped, "warn"), seg(x.sent, "ok"));
+      stack.style.height = `${Math.max(2, (n / max) * 100)}%`;
+      const wd = WEEKDAYS[new Date(d + "T00:00:00").getDay()];
+      return h("div", { class: "bar clickable", title: "Xem câu hỏi ngày này",
+        onclick: () => { Object.assign(f, { date_from: d, date_to: d, offset: 0 }); route(); } },
+      h("span", { class: "n" }, n || ""), stack, h("span", { class: "d" }, h("span", { class: "wd" }, wd + " "), d.slice(8)));
+    }));
+    const pickConv = (id) => (e) => { e.preventDefault(); Object.assign(f, { conversation_id: String(id), offset: 0 }); route(); };
+    const pickAsker = (name) => (e) => { e.preventDefault(); Object.assign(f, { asker: name, offset: 0 }); route(); };
+
+    statsBox.replaceChildren(
+      h("div", { class: "grid cards" },
+        card("Câu hỏi", st.total, `${fmtDate(df)} → ${fmtDate(dt)}`),
+        card("Đã trả lời", st.by_status.sent, st.total ? `${Math.round((st.by_status.sent / st.total) * 100)}% số câu hỏi` : null),
+        card("Bỏ qua", st.by_status.skipped, st.by_status.claimed ? `${st.by_status.claimed} câu đang soạn / dở dang` : "Không có câu dở dang"),
+        card("Thời gian phản hồi", fmtMinutes(rt.median),
+          rt.count ? `trung vị · TB ${fmtMinutes(rt.avg)} · chậm nhất ${fmtMinutes(rt.max)}` : "chưa có dữ liệu")),
+      h("div", { class: "grid two-col" },
+        h("div", { class: "panel panel-pad" }, h("h2", {}, "Theo ngày"),
+          h("div", { class: "legend muted small" },
+            h("span", { class: "dot ok" }), "Đã trả lời", h("span", { class: "dot warn" }), "Bỏ qua",
+            h("span", { class: "dot primary" }), "Đang soạn"),
+          bars),
+        h("div", { class: "panel panel-pad" },
+          h("h2", {}, "Theo hội thoại"),
+          st.by_conversation.length
+            ? h("ul", { class: "cat-list" }, st.by_conversation.map((c) => h("li", {},
+              h("a", { href: "#/replies", onclick: pickConv(c.id) },
+                c.name, h("span", { class: "muted small" }, c.kind === "direct" ? " · nhắn riêng" : " · nhóm")),
+              h("span", { class: "nowrap" }, h("span", { class: "badge ok", title: "Đã trả lời" }, c.sent), " ",
+                c.skipped ? h("span", { class: "badge warn", title: "Bỏ qua" }, c.skipped) : null))))
+            : h("p", { class: "muted" }, "Chưa có câu hỏi nào trong khoảng này."),
+          st.top_askers.length ? h("h2", { class: "mt" }, "Người hỏi nhiều nhất") : null,
+          st.top_askers.length ? h("ul", { class: "cat-list" }, st.top_askers.map((a) => h("li", {},
+            a.asker === "(không rõ)" ? h("span", {}, a.asker) : h("a", { href: "#/replies", onclick: pickAsker(a.asker) }, a.asker),
+            h("span", { class: "badge" }, a.total)))) : null)));
+  }
+
+  async function loadTable() {
+    tableBox.replaceChildren(h("div", { class: "empty" }, "Đang tải…"));
+    let data;
+    try { data = await api("GET", "/api/replies" + qs(f)); } catch (e) { fail(e); tableBox.replaceChildren(); return; }
+    if (!data.replies.length) {
+      tableBox.replaceChildren(h("div", { class: "empty" }, "Chưa có câu hỏi nào khớp bộ lọc."));
+    } else {
+      tableBox.replaceChildren(h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Hỏi lúc"), h("th", {}, "Người hỏi / hội thoại"), h("th", {}, "Câu hỏi → trả lời"),
+          h("th", {}, "Trạng thái"), h("th", {}, "Phản hồi sau"))),
+        h("tbody", {}, data.replies.map((r) => h("tr", { class: "clickable", onclick: () => replyDetail(r.id) },
+          h("td", { class: "nowrap muted" }, fmtDateTime(r.asked_at || r.created_at)),
+          h("td", { class: "emp" }, h("div", {}, r.asker || "(không rõ)"), h("div", { class: "muted small" }, r.conversation)),
+          h("td", { class: "subject" }, h("div", { class: "title" }, clip(r.question, 200)),
+            h("div", { class: "preview" }, r.status === "sent" ? "↳ " + clip(r.reply_text, 220) : (r.note ? "Ghi chú: " + clip(r.note, 200) : ""))),
+          h("td", {}, replyBadge(r), r.sources ? h("div", { class: "muted small" }, `${r.sources} nguồn`) : null),
+          h("td", { class: "nowrap muted" }, r.status === "sent" ? fmtMinutes(r.response_minutes) : "—"))))));
+    }
+    const from = data.total ? f.offset + 1 : 0;
+    const to = f.offset + data.count;
+    pager.replaceChildren(
+      h("span", { class: "muted" }, `${from}–${to} / ${data.total} câu hỏi`),
+      h("div", { class: "btns" },
+        h("select", { onchange: (e) => { f.limit = +e.target.value; f.offset = 0; loadTable(); } },
+          [20, 50, 100, 200].map((n) => h("option", { value: n, selected: n === f.limit }, `${n} / trang`))),
+        h("button", { class: "btn sm", type: "button", disabled: f.offset === 0, onclick: () => { f.offset = Math.max(0, f.offset - f.limit); loadTable(); } }, "‹ Trước"),
+        h("button", { class: "btn sm", type: "button", disabled: to >= data.total, onclick: () => { f.offset += f.limit; loadTable(); } }, "Sau ›")));
+  }
+
+  function reload() { loadStats().catch(fail); loadTable(); }
+  await Promise.all([loadStats(), loadTable()]);
+}
+
+async function replyDetail(id) {
+  let r;
+  try { r = await api("GET", `/api/replies/${id}`); } catch (e) { return fail(e); }
+  const row = (k, v) => (v ? [h("dt", {}, k), h("dd", {}, v)] : []);
+  openModal({
+    title: `Câu hỏi của ${r.asker || "(không rõ)"}`,
+    wide: true,
+    body: [
+      h("dl", { class: "meta" },
+        row("Hội thoại", `${r.conversation} (${r.kind === "direct" ? "nhắn riêng" : "nhóm"})`),
+        row("Hỏi lúc", fmtDateTime(r.asked_at)),
+        row("Trợ lý nhận lúc", fmtDateTime(r.created_at)),
+        row("Trả lời lúc", r.replied_at ? `${fmtDateTime(r.replied_at)} (sau ${fmtMinutes(r.response_minutes)})` : null),
+        row("Trạng thái", replyBadge(r)),
+        row("Ghi chú", r.note),
+        row("Mã", `#${r.id}`)),
+      h("h2", { class: "mt" }, "Câu hỏi"),
+      h("pre", { class: "body-text" }, r.question),
+      h("h2", { class: "mt" }, "Trợ lý trả lời"),
+      h("pre", { class: "body-text" }, r.reply_text || (r.status === "skipped" ? "(không trả lời)" : "(chưa có)")),
+      r.source_reports.length ? h("h2", { class: "mt" }, `Nguồn email (${r.source_reports.length})`) : null,
+      r.source_reports.length ? h("ul", { class: "people" }, r.source_reports.map((s) => h("li", {},
+        s.missing ? h("div", { class: "muted" }, `Email #${s.id} (đã bị xoá)`)
+          : h("div", { class: "who" }, h("div", {}, s.subject || "(không tiêu đề)"),
+            h("div", {}, `${s.employee_name} · ${fmtDate(s.report_date)}${s.summary ? " · " + clip(s.summary, 120) : ""}`)),
+        s.missing ? null : h("button", { class: "btn sm", type: "button", onclick: () => reportDetail(s.id) }, "Xem")))) : null,
+      r.source_zalo.length ? h("h2", { class: "mt" }, `Nguồn tin Zalo (${r.source_zalo.length})`) : null,
+      r.source_zalo.length ? h("ul", { class: "people" }, r.source_zalo.map((s) => h("li", {},
+        s.missing ? h("div", { class: "muted" }, `Tin Zalo #${s.id} (đã bị xoá)`)
+          : h("div", { class: "who" }, h("div", {}, s.summary || clip(s.text, 200)),
+            h("div", {}, `${s.sender || "?"} · ${s.conversation} · ${fmtDateTime(s.sent_at)}`))))) : null,
+    ],
+    footer: [h("button", { class: "btn", type: "button", onclick: closeModal }, "Đóng")],
+  });
+}

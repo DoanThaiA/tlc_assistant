@@ -10,7 +10,11 @@
  *   3. Chọn hàm `setup` → Run → cấp quyền. Từ đó script tự chạy theo chu kỳ TRIGGER_MINUTES.
  *
  * Hàm tiện ích: testConnection() kiểm tra kết nối, resetCheckpoint() để lấy lại từ đầu,
- * removeTriggers() để dừng tự động.
+ * removeTriggers() để dừng tự động, backfillAttachments() gửi lại NỘI DUNG FILE ĐÍNH KÈM của email cũ
+ * (email đã nhập trước khi có tính năng đọc file — chạy nhiều lần tới khi log báo "Đã xong").
+ *
+ * File đính kèm: script gửi nội dung file (base64) cho các định dạng server đọc được (PDF, Word, Excel,
+ * PowerPoint, CSV, TXT...), server trích văn bản để Claude đọc / tìm kiếm. File quá lớn chỉ gửi tên.
  */
 
 const CONFIG = {
@@ -33,6 +37,13 @@ const CONFIG = {
   SOURCE: 'gmail',
   // Dừng sớm để không vượt giới hạn 6 phút/lần chạy của Apps Script
   MAX_RUNTIME_MS: 4.5 * 60 * 1000,
+  // File đính kèm: gửi nội dung các file có đuôi này, mỗi file tối đa ATTACHMENT_MAX_BYTES
+  ATTACHMENT_EXT: /\.(pdf|docx|docm|xlsx|xlsm|xls|pptx|csv|tsv|txt|md|json|xml|html?)$/i,
+  ATTACHMENT_MAX_BYTES: 10 * 1024 * 1024,
+  // Mỗi lần gửi tối đa ~14 MB JSON (nginx nhận tối đa 20 MB; base64 làm file to thêm ~33%)
+  REQUEST_MAX_CHARS: 14 * 1024 * 1024,
+  // backfillAttachments(): quét lại email có file đính kèm của N ngày gần nhất
+  BACKFILL_DAYS: 30,
 };
 
 /** Chạy 1 lần: tạo trigger định kỳ, kiểm tra kết nối, đồng bộ lần đầu. */
@@ -89,13 +100,16 @@ function syncReports() {
       ? (GmailApp.getUserLabelByName(CONFIG.LABEL_NAME) || GmailApp.createLabel(CONFIG.LABEL_NAME))
       : null;
     const total = { inserted: 0, duplicate: 0, failed: 0 };
-    for (let i = 0; i < pending.length; i += CONFIG.BATCH_SIZE) {
+    let i = 0;
+    while (i < pending.length) {
       if (Date.now() - started > CONFIG.MAX_RUNTIME_MS) {
         console.log('Hết thời gian, phần còn lại sẽ gửi ở lượt sau.');
         break;
       }
-      const batch = pending.slice(i, i + CONFIG.BATCH_SIZE);
-      const res = postReports_(batch.map(function (x) { return toReport_(x.message, x.thread); }));
+      const next = nextBatch_(pending, i);
+      const batch = next.items;
+      i = next.end;
+      const res = postReports_(next.reports);
       total.inserted += res.inserted;
       total.duplicate += res.duplicate;
       total.failed += res.failed;
@@ -137,6 +151,69 @@ function resetCheckpoint() {
   console.log('Đã xoá mốc đồng bộ.');
 }
 
+/**
+ * Gửi lại NỘI DUNG FILE ĐÍNH KÈM của email cũ (BACKFILL_DAYS ngày gần nhất). Server chỉ bổ sung văn bản file
+ * cho email đã có (không tạo trùng; email đã loại thì bỏ qua). Mỗi lần chạy tối đa ~4,5 phút; chạy lại tới khi
+ * log báo "Đã xong". Muốn quét lại từ đầu: resetBackfill().
+ */
+function backfillAttachments() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { console.log('Đang có lượt đồng bộ khác chạy, thử lại sau.'); return; }
+  try {
+    const started = Date.now();
+    const props = PropertiesService.getScriptProperties();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const before = Number(props.getProperty('BACKFILL_BEFORE') || 0) || nowSec + 60;
+    let start = Number(props.getProperty('BACKFILL_START') || 0);
+    props.setProperty('BACKFILL_BEFORE', String(before));
+    const after = before - CONFIG.BACKFILL_DAYS * 86400;
+    const query = CONFIG.SEARCH_QUERY + ' has:attachment after:' + after + ' before:' + before;
+    const me = (Session.getEffectiveUser().getEmail() || '').toLowerCase();
+    const total = { sent: 0, updated: 0, inserted: 0 };
+    for (;;) {
+      if (Date.now() - started > CONFIG.MAX_RUNTIME_MS) {
+        console.log('Hết thời gian. Đã gửi ' + JSON.stringify(total) + '. Chạy lại backfillAttachments để tiếp tục.');
+        return;
+      }
+      const threads = GmailApp.search(query, start, 10);
+      const items = [];
+      threads.forEach(function (thread) {
+        thread.getMessages().forEach(function (m) {
+          if (m.isDraft() || m.isInTrash()) return;
+          if (CONFIG.EXCLUDE_SELF && extractEmail_(m.getFrom()) === me) return;
+          const atts = m.getAttachments({ includeInlineImages: false });
+          if (!atts.some(function (a) { return CONFIG.ATTACHMENT_EXT.test(a.getName()); })) return;
+          items.push({ message: m, thread: thread });
+        });
+      });
+      for (let i = 0; i < items.length;) {
+        const next = nextBatch_(items, i);
+        i = next.end;
+        const res = postReports_(next.reports);
+        total.sent += next.reports.length;
+        total.updated += res.attachments_updated || 0;
+        total.inserted += res.inserted || 0;
+      }
+      start += threads.length;
+      props.setProperty('BACKFILL_START', String(start));
+      if (threads.length < 10) break;
+    }
+    props.deleteProperty('BACKFILL_BEFORE');
+    props.deleteProperty('BACKFILL_START');
+    console.log('Đã xong: ' + JSON.stringify(total) + ' (updated = số email được bổ sung nội dung file).');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Quét lại backfillAttachments từ đầu. */
+function resetBackfill() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('BACKFILL_BEFORE');
+  props.deleteProperty('BACKFILL_START');
+  console.log('Đã xoá tiến độ backfill.');
+}
+
 /** Dừng tự động đồng bộ. */
 function removeTriggers() {
   ScriptApp.getProjectTriggers()
@@ -171,6 +248,47 @@ function postReports_(reports) {
   return JSON.parse(res.getContentText());
 }
 
+/** Gom lô email từ vị trí start: tối đa BATCH_SIZE email và REQUEST_MAX_CHARS ký tự JSON. */
+function nextBatch_(list, start) {
+  const items = [];
+  const reports = [];
+  let size = 0;
+  let i = start;
+  while (i < list.length && items.length < CONFIG.BATCH_SIZE) {
+    const x = list[i];
+    if (!x.report) x.report = toReport_(x.message, x.thread);
+    const len = JSON.stringify(x.report).length;
+    if (items.length && size + len > CONFIG.REQUEST_MAX_CHARS) break; // để lô sau (x.report giữ lại, khỏi đọc lại file)
+    items.push(x);
+    reports.push(x.report);
+    size += len;
+    i++;
+  }
+  items.forEach(function (x) { delete x.report; });
+  return { items: items, reports: reports, end: i };
+}
+
+/** File đính kèm -> {name, mime_type, size, data(base64)}; file quá lớn / không đọc được thì chỉ gửi tên + lý do. */
+function toAttachments_(m) {
+  let budget = CONFIG.REQUEST_MAX_CHARS - 200000; // chừa chỗ cho nội dung email
+  return m.getAttachments({ includeInlineImages: false })
+    .map(function (a) { return { a: a, name: a.getName(), size: a.getSize() }; })
+    .sort(function (x, y) { return x.size - y.size; }) // tổng dung lượng vượt giới hạn: ưu tiên file nhỏ
+    .map(function (x) {
+      const out = { name: x.name, mime_type: x.a.getContentType(), size: x.size };
+      if (!CONFIG.ATTACHMENT_EXT.test(x.name)) { out.skipped = 'unsupported'; return out; }
+      const b64len = Math.ceil(x.size / 3) * 4;
+      if (x.size > CONFIG.ATTACHMENT_MAX_BYTES || b64len > budget) { out.skipped = 'too_large'; return out; }
+      try {
+        out.data = Utilities.base64Encode(x.a.getBytes());
+        budget -= out.data.length;
+      } catch (e) {
+        out.skipped = 'Không đọc được file: ' + e;
+      }
+      return out;
+    });
+}
+
 function toReport_(m, thread) {
   let body = m.getPlainBody() || m.getBody() || '';
   if (body.length > CONFIG.MAX_BODY_CHARS) body = body.slice(0, CONFIG.MAX_BODY_CHARS) + '\n…[đã cắt bớt]';
@@ -183,7 +301,7 @@ function toReport_(m, thread) {
     subject: m.getSubject(),
     body: body,
     sent_at: m.getDate().toISOString(),
-    attachments: m.getAttachments({ includeInlineImages: false }).map(function (a) { return a.getName(); }),
+    attachments: toAttachments_(m),
     to: m.getTo(),
     cc: m.getCc(),
     thread_id: thread ? thread.getId() : '',

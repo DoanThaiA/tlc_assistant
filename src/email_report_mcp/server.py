@@ -88,6 +88,15 @@ Status = Annotated[
 # ---------------------------------------------------------------------------
 # NHẬP & LỌC
 # ---------------------------------------------------------------------------
+class AttachmentInput(BaseModel):
+    name: str = Field(description="Tên file")
+    mime_type: str | None = Field(default=None, description="Kiểu file (vd application/pdf)")
+    size: int | None = Field(default=None, description="Kích thước (byte)")
+    data: str | None = Field(default=None, description="Nội dung file mã hoá base64 — server tự trích văn bản")
+    text: str | None = Field(default=None, description="Văn bản đã trích sẵn (nếu client tự đọc file)")
+    skipped: str | None = Field(default=None, description="Lý do không gửi nội dung: too_large | unsupported | ...")
+
+
 class ReportInput(BaseModel):
     sender_email: str = Field(description="Email người gửi")
     sender_name: str | None = Field(default=None, description="Tên hiển thị người gửi")
@@ -100,7 +109,8 @@ class ReportInput(BaseModel):
     report_date: str | None = Field(
         default=None, description="Ngày của nội dung YYYY-MM-DD. Bỏ trống để tự suy ra từ tiêu đề hoặc ngày gửi"
     )
-    attachments: list[str] | None = Field(default=None, description="Tên các file đính kèm")
+    attachments: list[str | AttachmentInput] | None = Field(
+        default=None, description="File đính kèm: tên file, hoặc object {name, mime_type, size, data(base64)}")
     to: str | None = Field(default=None, description="Người nhận")
     cc: str | None = Field(default=None, description="CC")
     thread_id: str | None = Field(default=None, description="Id luồng hội thoại (Gmail thread id)")
@@ -137,7 +147,8 @@ def get_pending_emails(
     max_chars_each: Annotated[int, Field(ge=300, le=10000, description="Cắt bớt nội dung mỗi email")] = 2000,
 ) -> dict:
     """Lấy lô email CHỜ DUYỆT (cũ nhất trước) kèm quy tắc lọc và danh mục phân loại.
-    Mỗi email có is_employee, sender_kept_before / sender_discarded_before (lịch sử duyệt người gửi này)
+    Mỗi email có is_employee, sender_kept_before / sender_discarded_before (lịch sử duyệt người gửi này),
+    attachments (tên file + read_status + đoạn đầu văn bản file — nội dung báo cáo hay nằm trong file đính kèm)
     để hỗ trợ quyết định. Sau khi quyết định, gọi review_emails."""
     data = db.pending_emails(limit, max_chars_each)
     return {
@@ -193,7 +204,9 @@ def get_overview() -> dict:
 
 @mcp.tool(annotations=READ_ONLY)
 def get_report(report_id: Annotated[int, Field(description="id email")]) -> dict:
-    """Xem đầy đủ một email: nội dung, người nhận, CC, đính kèm, phân loại, tóm tắt, luồng."""
+    """Xem đầy đủ một email: nội dung, người nhận, CC, phân loại, tóm tắt, luồng và FILE ĐÍNH KÈM — mỗi file có
+    `text` (văn bản đã trích từ PDF/Word/Excel/PowerPoint/CSV) và `read_status` (đã đọc / ảnh scan / chưa hỗ trợ...).
+    Khi trả lời dựa trên file đính kèm, nêu rõ tên file."""
     r = db.get_report(report_id)
     if not r:
         raise ValueError(f"Không tìm thấy email id={report_id}")
@@ -258,7 +271,7 @@ def search_reports(
         description="relevance = khớp nhất; oldest = theo dòng thời gian (xem diễn biến)")] = "relevance",
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
 ) -> dict:
-    """Tìm kiếm toàn văn (tiêu đề, nội dung, tóm tắt, tag, tên file đính kèm, người gửi), không phân biệt dấu.
+    """Tìm kiếm toàn văn (tiêu đề, nội dung, tóm tắt, tag, tên + VĂN BẢN file đính kèm, người gửi), không phân biệt dấu.
     Ưu tiên khớp tất cả từ, nếu không có thì khớp bất kỳ từ nào."""
     return db.search_reports(query, date_from, date_to, employee, limit, status=status, category=category,
                              tag=tag, sender_domain=sender_domain, sort=sort)
