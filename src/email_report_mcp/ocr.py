@@ -2,7 +2,8 @@
 
 Luồng: /ingest trích văn bản như thường; file không có lớp chữ (PDF scan) hoặc ảnh -> attachments.status =
 "ocr_pending", nội dung file được giữ TẠM trong bảng ocr_queue. Luồng nền lấy từng file, gửi OCR.space, ghi văn bản
-vào email, đánh chỉ mục tìm kiếm lại rồi XOÁ file tạm.
+vào email, đánh chỉ mục tìm kiếm lại rồi XOÁ file tạm. Ảnh trong tin Zalo (bảng zalo_images, status =
+"ocr_pending") đi chung luồng này, sau file đính kèm email.
 
 Giới hạn gói miễn phí OCR.space: 1 MB / lần gửi, 3 trang PDF / lần, 500 lượt / ngày / IP. Vì vậy:
   - PDF được tách thành từng phần OCR_PDF_PAGES trang; trang quá lớn thì lấy ảnh trong trang, nén lại rồi OCR.
@@ -68,7 +69,10 @@ def _count_call() -> None:
 def status() -> dict:
     with db.connect() as conn:
         q = conn.execute("SELECT COUNT(*), MIN(created_at) FROM ocr_queue").fetchone()
-    return {"enabled": enabled(), "queued": q[0], "oldest_queued_at": q[1], "used_today": usage_today(),
+        z = conn.execute("SELECT COUNT(*), MIN(created_at) FROM zalo_images WHERE status='ocr_pending'").fetchone()
+    oldest = min(filter(None, [q[1], z[1]]), default=None)
+    return {"enabled": enabled(), "queued": q[0] + z[0], "queued_email": q[0], "queued_zalo": z[0],
+            "oldest_queued_at": oldest, "used_today": usage_today(),
             "daily_limit": settings.ocr_daily_limit,
             "paused": _paused_until > time.time(), "engine": settings.ocr_engine}
 
@@ -263,10 +267,74 @@ def _finish(row: Any, text: str, note: str | None, failed: str | None = None) ->
 
 
 def process_one() -> bool:
-    """Xử lý 1 file trong hàng đợi. Trả về True nếu có làm việc (để gọi tiếp ngay)."""
+    """Xử lý 1 file trong hàng đợi (file đính kèm email trước, rồi ảnh Zalo). True nếu có làm việc."""
     global _paused_until
     if not enabled() or _paused_until > time.time() or usage_today() >= settings.ocr_daily_limit:
         return False
+    try:
+        return _process_report() or _process_zalo()
+    except QuotaError as e:
+        log.warning("OCR tạm dừng 1 giờ: %s", e)
+        _paused_until = time.time() + 3600
+        return False
+
+
+def _retry_at(tries: int) -> str:
+    return (_now() + timedelta(minutes=_BACKOFF_MIN[tries - 1])).isoformat(timespec="seconds")
+
+
+def _finish_zalo(image_id: int, text: str, failed: str | None = None) -> None:
+    from . import zalo
+    from .attachments import _clean
+
+    text = _clean(text or "")
+    if len(text) > zalo.IMAGE_TEXT_CHARS:
+        text = text[:zalo.IMAGE_TEXT_CHARS] + "…"
+    with db.connect() as conn:
+        img = conn.execute("SELECT message_id, status FROM zalo_images WHERE id=?", (image_id,)).fetchone()
+        if not img or img["status"] != "ocr_pending":  # đã bị xoá / Claude đã tự đọc
+            return
+        if failed:
+            vals = ("error", None, None, f"OCR lỗi: {failed}"[:200])
+        elif text:
+            vals = ("ok", text, "ocr", None)
+        else:
+            vals = ("no_text", None, "ocr", "OCR không tìm thấy chữ trong ảnh")
+        conn.execute("UPDATE zalo_images SET status=?, text=?, source=?, note=?, data=NULL WHERE id=?",
+                     (*vals, image_id))
+        zalo._index(conn, img["message_id"])
+
+
+def _process_zalo() -> bool:
+    now = _now().isoformat(timespec="seconds")
+    with db.connect() as conn:
+        row = conn.execute("SELECT id, data, tries FROM zalo_images WHERE status='ocr_pending' AND next_try_at <= ? "
+                           "ORDER BY id LIMIT 1", (now,)).fetchone()
+    if not row:
+        return False
+    if row["data"] is None:
+        _finish_zalo(row["id"], "", failed="mất dữ liệu ảnh")
+        return True
+    try:
+        text = _ocr_image(bytes(row["data"]))
+    except QuotaError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        tries = row["tries"] + 1
+        msg = str(e) or e.__class__.__name__
+        if tries >= MAX_TRIES:
+            log.warning("OCR ảnh Zalo #%s thất bại sau %s lần: %s", row["id"], tries, msg)
+            _finish_zalo(row["id"], "", failed=msg)
+        else:
+            with db.connect() as conn:
+                conn.execute("UPDATE zalo_images SET tries=?, next_try_at=?, last_error=? WHERE id=?",
+                             (tries, _retry_at(tries), msg[:300], row["id"]))
+        return True
+    _finish_zalo(row["id"], text)
+    return True
+
+
+def _process_report() -> bool:
     now = _now().isoformat(timespec="seconds")
     with db.connect() as conn:
         row = conn.execute("SELECT q.*, r.status AS report_status FROM ocr_queue q "
@@ -279,10 +347,8 @@ def process_one() -> bool:
         return False
     try:
         text, note = ocr_file(row["att_name"], row["mime_type"], bytes(row["data"]))
-    except QuotaError as e:
-        log.warning("OCR tạm dừng 1 giờ: %s", e)
-        _paused_until = time.time() + 3600
-        return False
+    except QuotaError:
+        raise
     except Exception as e:  # noqa: BLE001
         tries = row["tries"] + 1
         msg = str(e) or e.__class__.__name__
@@ -290,10 +356,9 @@ def process_one() -> bool:
             log.warning("OCR %s thất bại sau %s lần: %s", row["att_name"], tries, msg)
             _finish(row, "", None, failed=msg)
         else:
-            nxt = (_now() + timedelta(minutes=_BACKOFF_MIN[tries - 1])).isoformat(timespec="seconds")
             with db.connect() as conn:
                 conn.execute("UPDATE ocr_queue SET tries=?, next_try_at=?, last_error=? WHERE id=?",
-                             (tries, nxt, msg[:300], row["id"]))
+                             (tries, _retry_at(tries), msg[:300], row["id"]))
         return True
     _finish(row, text, note)
     return True

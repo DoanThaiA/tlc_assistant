@@ -380,9 +380,33 @@ Zalo cá nhân không có API đọc tin, nên Claude Desktop dùng **Claude in 
 Quy tắc thu thập + trả lời lưu trong `app_settings` (khoá `zalo_rules`), xem / sửa bằng `update_zalo_rules`.
 Zalo có thể hạn chế tài khoản gửi tin tự động quá nhiều — trợ lý chỉ nhắn khi CEO hỏi.
 
+### Ảnh trong tin Zalo
+
+Ảnh có thông tin công việc (chụp bảng tính, chứng từ, hoá đơn, phiếu giao / nhận, màn hình số liệu, biên bản) được
+đọc theo 2 lớp. Ảnh vui, selfie, sticker thì bỏ qua.
+
+1. **Claude** nhìn ảnh trên màn hình, ghi **1 câu mô tả** (vd "ảnh chụp bảng doanh số tuần 45"), rồi lấy **link
+   ảnh** (thẻ `<img>`, CDN `*.zdn.vn`) và gửi kèm tin trong `save_zalo_messages` (`images: [{url, description}]`).
+2. **Máy chủ** tải ảnh về ngay, nhưng chỉ từ các tên miền trong `ZALO_IMAGE_HOSTS` và không đi theo chuyển hướng
+   ra tên miền khác. Sau đó đưa ảnh vào **hàng đợi OCR** dùng chung với file đính kèm email (cùng giới hạn lượt
+   OCR.space mỗi ngày). Chữ đọc được sẽ tìm được bằng `search_zalo` và xem đủ bằng `get_zalo_messages` (trường
+   `images`). Ảnh gốc xoá ngay sau khi OCR xong.
+3. **Máy chủ không tải được** ảnh (link cần đăng nhập Zalo / hết hạn / chỉ có `blob:`, hoặc chưa bật OCR): kết quả
+   trả về `images_to_read`. Claude tự mở ảnh to ra, đọc chữ / số liệu rồi gọi `save_zalo_image_text`, tối đa ~10 ảnh
+   mỗi lượt để không kéo dài lượt 15 phút.
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `ZALO_IMAGE_HOSTS` | `zdn.vn,zadn.vn,zalo.me` | Tên miền (kể cả tên miền con) máy chủ được phép tải ảnh |
+| `ZALO_IMAGE_MAX_BYTES` | 15 MB | Ảnh lớn hơn thì bỏ, để Claude tự đọc |
+| `ZALO_IMAGE_TIMEOUT` | 20 | Số giây chờ tải mỗi ảnh |
+
+Ảnh Zalo được gửi tới OCR.space giống file đính kèm email. Bảng `zalo_images` lưu mô tả, chữ đọc được, nguồn
+(`ocr` / `claude`) và trạng thái của từng ảnh. Xoá tin hoặc hội thoại thì ảnh bị xoá theo.
+
 ## Các tool
 
-27 tool, chỉ phục vụ 2 nhiệm vụ trên. Thao tác quản trị (nhập email tay, xoá email, quản lý nhân viên, dọn email đã
+28 tool, chỉ phục vụ 2 nhiệm vụ trên. Thao tác quản trị (nhập email tay, xoá email, quản lý nhân viên, dọn email đã
 loại) chỉ làm trên trang quản trị web, không mở qua MCP để trợ lý tự động không thể xoá / sửa nhầm dữ liệu.
 
 **Lượt định kỳ & lọc email**
@@ -413,7 +437,8 @@ loại) chỉ làm trên trang quản trị web, không mở qua MCP để trợ
 
 | Tool | Mục đích |
 |---|---|
-| `save_zalo_messages` | Lưu tin có thông tin công việc của một hội thoại + cập nhật mốc đã đọc; chống trùng |
+| `save_zalo_messages` | Lưu tin có thông tin công việc của một hội thoại + cập nhật mốc đã đọc; chống trùng; ảnh kèm link -> máy chủ tải + OCR |
+| `save_zalo_image_text` | Lưu chữ Claude tự đọc từ ảnh mà máy chủ không tải được (`images_to_read`) |
 | `claim_zalo_question` / `record_zalo_reply` | Xin phép trả lời câu hỏi của CEO (chỉ hội thoại riêng, đúng người, chưa trả lời) / ghi lại câu trả lời đã gửi |
 | `get_zalo_replies` | Nhật ký câu hỏi của CEO đã trả lời trên Zalo kèm nguồn |
 | `upsert_zalo_conversation` | Thêm / bỏ theo dõi nhóm; khai báo hội thoại trả lời (CEO riêng, nhóm trợ lý) |
@@ -449,7 +474,8 @@ uv run python tests/smoke_test.py
 Lệnh trên chạy kiểm thử đầu-cuối: dựng server HTTP thật trên CSDL tạm và gọi toàn bộ tool. Các kiểm thử khác:
 `tests/flow_test.py` (lọc + hỏi đáp email), `tests/zalo_test.py` (Zalo: thu thập, trả lời, điểm tin), `tests/admin_test.py`,
 `tests/attachments_test.py` (đọc file đính kèm + trang lịch sử trả lời), `tests/zalo_admin_test.py` (cấu hình hội
-thoại Zalo trên trang quản trị), `tests/ocr_test.py` (OCR với server OCR.space giả, không tốn lượt).
+thoại Zalo trên trang quản trị), `tests/ocr_test.py` (OCR với server OCR.space giả, không tốn lượt),
+`tests/zalo_images_test.py` (ảnh Zalo: tải ảnh, chặn tên miền lạ, OCR, Claude tự đọc).
 
 Muốn nạp dữ liệu cũ từ file JSON (mảng object cùng cấu trúc với body của `/ingest`):
 

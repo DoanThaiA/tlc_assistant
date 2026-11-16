@@ -59,5 +59,12 @@ class Settings:
     ocr_timeout: int = int(os.getenv("OCR_TIMEOUT", "120"))
     ocr_poll_seconds: float = float(os.getenv("OCR_POLL_SECONDS", "10"))
 
+    # --- Ảnh trong tin Zalo: máy chủ chỉ tải ảnh từ các tên miền này (CDN ảnh của Zalo), rồi OCR ---
+    zalo_image_hosts: list[str] = field(
+        default_factory=lambda: [h.lower().lstrip(".") for h in _list("ZALO_IMAGE_HOSTS", "zdn.vn,zadn.vn,zalo.me")]
+    )
+    zalo_image_max_bytes: int = int(os.getenv("ZALO_IMAGE_MAX_BYTES", str(15 * 1024 * 1024)))
+    zalo_image_timeout: int = int(os.getenv("ZALO_IMAGE_TIMEOUT", "20"))
+
 
 settings = Settings()

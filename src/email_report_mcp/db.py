@@ -134,6 +134,27 @@ CREATE TABLE IF NOT EXISTS ocr_queue (
     last_error   TEXT,
     created_at   TEXT NOT NULL
 );
+
+-- Ảnh trong tin Zalo (chụp bảng tính, chứng từ, hoá đơn...): mô tả ngắn của Claude + chữ đọc được (OCR hoặc Claude
+-- tự đọc). Ảnh gốc chỉ giữ TẠM ở cột data cho tới khi OCR xong (xem ocr.py)
+CREATE TABLE IF NOT EXISTS zalo_images (
+    id           INTEGER PRIMARY KEY,
+    message_id   INTEGER NOT NULL REFERENCES zalo_messages(id) ON DELETE CASCADE,
+    url          TEXT,
+    description  TEXT,
+    status       TEXT NOT NULL,   -- ocr_pending | ok | no_text | described | download_failed | no_ocr | error
+    text         TEXT,
+    source       TEXT,            -- ocr | claude
+    note         TEXT,
+    data         BLOB,
+    tries        INTEGER NOT NULL DEFAULT 0,
+    next_try_at  TEXT,
+    last_error   TEXT,
+    created_at   TEXT NOT NULL,
+    UNIQUE(message_id, url)
+);
+CREATE INDEX IF NOT EXISTS idx_zalo_images_msg ON zalo_images(message_id);
+CREATE INDEX IF NOT EXISTS idx_zalo_images_queue ON zalo_images(status, next_try_at);
 """
 
 # Cột thêm sau (tự migrate CSDL cũ). Email cũ mặc định "kept".

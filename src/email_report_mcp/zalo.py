@@ -14,9 +14,14 @@ Tin trò chuyện thường (chào hỏi, "ok", sticker...) KHÔNG được lưu
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -31,7 +36,8 @@ DEFAULT_ZALO_RULES = """LƯU (thông tin công việc CEO có thể cần hỏi 
 - Vướng mắc, sự cố, chậm trễ, rủi ro, khiếu nại của khách hàng; đề xuất, xin ý kiến, xin duyệt.
 - Quyết định, chỉ đạo, phân công (ai làm gì, hạn khi nào), thay đổi kế hoạch.
 - Thông tin khách hàng / đối tác / dự án: báo giá, hợp đồng, đơn hàng, lịch giao, lịch họp.
-- Tin có file / ảnh chứng từ quan trọng: ghi lại tên file và ý chính đi kèm.
+- Tin có file / ảnh chứng từ quan trọng: ghi lại tên file và ý chính đi kèm; ảnh có thông tin công việc (bảng tính,
+  chứng từ, hoá đơn, phiếu, màn hình số liệu) lưu kèm images (mô tả + link) để đọc được chữ trong ảnh.
 
 KHÔNG LƯU:
 - Chào hỏi, cảm ơn, "ok", "dạ vâng", sticker, emoji, tin đùa vui, chuyện cá nhân.
@@ -278,19 +284,187 @@ def _index(conn: sqlite3.Connection, mid: int) -> None:
     m = conn.execute("SELECT m.*, c.name AS conversation FROM zalo_messages m "
                      "JOIN zalo_conversations c ON c.id=m.conversation_id WHERE m.id=?", (mid,)).fetchone()
     if m:
+        imgs = [x for i in conn.execute("SELECT description, text FROM zalo_images WHERE message_id=? ORDER BY id",
+                                        (mid,)) for x in (i["description"], i["text"])]
         conn.execute(
             "INSERT INTO zalo_messages_fts(rowid, body, meta, sender) VALUES (?,?,?,?)",
-            (mid, norm(" ".join(filter(None, [m["summary"], m["text"]]))),
+            (mid, norm(" ".join(filter(None, [m["summary"], m["text"], *imgs]))),
              norm(" ".join(filter(None, [m["conversation"], (m["tags"] or "").replace(",", " "),
                                          (m["category"] or "").replace("_", " ")]))),
              norm(m["sender"])))
 
 
+# ---------------------------------------------------------------------------
+# Ảnh trong tin Zalo: Claude ghi mô tả ngắn + link ảnh; máy chủ tải ảnh (chỉ từ CDN Zalo) và OCR chạy nền.
+# Không tải được (link cần đăng nhập / hết hạn / blob:) -> trả về images_to_read để Claude tự đọc ảnh.
+# ---------------------------------------------------------------------------
+MAX_IMAGES_PER_MESSAGE = 20
+MAX_IMAGES_PER_CALL = 60
+IMAGE_TEXT_CHARS = 20000
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/130.0 Safari/537.36")
+
+
+def _host_ok(url: str | None) -> bool:
+    try:
+        p = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    return p.scheme in ("http", "https") and any(host == h or host.endswith("." + h)
+                                                 for h in settings.zalo_image_hosts)
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
+        if not _host_ok(newurl):
+            raise urllib.error.URLError("link chuyển hướng ra ngoài tên miền ảnh Zalo")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_image(url: str) -> bytes:
+    """Tải ảnh từ CDN Zalo (chỉ các tên miền ZALO_IMAGE_HOSTS). Lỗi -> ValueError có lý do dễ hiểu."""
+    if not _host_ok(url):
+        raise ValueError("link không thuộc tên miền ảnh Zalo (ZALO_IMAGE_HOSTS)")
+    opener = urllib.request.build_opener(_SafeRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Referer": "https://chat.zalo.me/",
+                                               "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"})
+    try:
+        with opener.open(req, timeout=settings.zalo_image_timeout) as r:
+            data = r.read(settings.zalo_image_max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"máy chủ ảnh trả về HTTP {e.code} (link cần đăng nhập Zalo hoặc đã hết hạn)") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ValueError(f"không tải được ảnh: {getattr(e, 'reason', e)}") from e
+    if len(data) > settings.zalo_image_max_bytes:
+        raise ValueError("ảnh quá lớn")
+    from PIL import Image
+
+    try:
+        Image.open(io.BytesIO(data)).verify()
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("link không trả về ảnh (có thể cần đăng nhập Zalo / link hết hạn)") from e
+    return data
+
+
+def _clip(text: str | None, n: int = IMAGE_TEXT_CHARS) -> str | None:
+    t = nfc(text).strip()
+    return (t[:n] + "…") if len(t) > n else (t or None)
+
+
+def _add_images(conn: sqlite3.Connection, mid: int, images: list[dict], now: str, ocr_on: bool,
+                fetch: list[tuple[int, str]], to_read: list[dict], counts: dict[str, int]) -> None:
+    for img in images[:MAX_IMAGES_PER_MESSAGE]:
+        url = (img.get("url") or "").strip() or None
+        desc = _clip(img.get("description"), 500)
+        text = _clip(img.get("text"))
+        if not (url or desc or text):
+            continue
+        if url is None and conn.execute("SELECT 1 FROM zalo_images WHERE message_id=? AND url IS NULL AND "
+                                        "COALESCE(description,'')=?", (mid, desc or "")).fetchone():
+            counts["duplicate"] += 1
+            continue
+        reason = None
+        if text:
+            status, source = "ok", "claude"
+        elif not url:
+            status, source = "described", None
+        elif not url.startswith(("http://", "https://")):
+            status, source, reason = "download_failed", None, "link không phải http(s) (vd blob:) — máy chủ không tải được"
+        elif not _host_ok(url):
+            status, source, reason = "download_failed", None, "link không thuộc tên miền ảnh Zalo (ZALO_IMAGE_HOSTS)"
+        elif not ocr_on:
+            status, source, reason = "no_ocr", None, "máy chủ chưa bật OCR (OCR_SPACE_API_KEY)"
+        else:
+            status, source = "downloading", None
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO zalo_images(message_id, url, description, status, text, source, note, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)", (mid, url, desc, status, text, source, reason, now))
+        if cur.rowcount == 0:
+            counts["duplicate"] += 1
+            continue
+        iid = cur.lastrowid
+        if status == "downloading":
+            fetch.append((iid, url))  # đếm sau khi tải (queued_ocr / not_downloaded)
+            continue
+        if reason:
+            to_read.append({"image_id": iid, "message_id": mid, "url": url, "description": desc, "reason": reason})
+        counts[{"ok": "read_by_claude", "described": "described"}.get(status, "not_downloaded")] += 1
+
+
+def _fetch_images(fetch: list[tuple[int, str]], to_read: list[dict], counts: dict[str, int]) -> None:
+    """Tải song song các ảnh cần OCR (ngoài giao dịch CSDL), rồi đưa vào hàng đợi OCR."""
+    if not fetch:
+        return
+
+    def get(item: tuple[int, str]) -> tuple[int, str, bytes | None, str | None]:
+        try:
+            return item[0], item[1], download_image(item[1]), None
+        except ValueError as e:
+            return item[0], item[1], None, str(e)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(get, fetch))
+    now = _iso(_now_dt())
+    with connect() as conn:
+        for iid, url, data, err in results:
+            if data is not None:
+                conn.execute("UPDATE zalo_images SET status='ocr_pending', data=?, next_try_at=? WHERE id=?",
+                             (data, now, iid))
+                counts["queued_ocr"] += 1
+            else:
+                conn.execute("UPDATE zalo_images SET status='download_failed', note=? WHERE id=?", (err, iid))
+                r = conn.execute("SELECT message_id, description FROM zalo_images WHERE id=?", (iid,)).fetchone()
+                counts["not_downloaded"] += 1
+                if r:
+                    to_read.append({"image_id": iid, "message_id": r["message_id"], "url": url,
+                                    "description": r["description"], "reason": err})
+
+
+def save_image_text(image_id: int, text: str, description: str | None = None) -> dict:
+    """Claude tự đọc ảnh (máy chủ không tải / OCR được) -> lưu chữ / số liệu đọc được vào ảnh đó."""
+    text = _clip(text)
+    if not text:
+        raise ValueError("text rỗng")
+    with connect() as conn:
+        r = conn.execute("SELECT message_id, description FROM zalo_images WHERE id=?", (image_id,)).fetchone()
+        if not r:
+            raise ValueError(f"Không có ảnh image_id={image_id}")
+        conn.execute("UPDATE zalo_images SET status='ok', text=?, source='claude', description=?, data=NULL, "
+                     "note=NULL WHERE id=?", (text, _clip(description, 500) or r["description"], image_id))
+        _index(conn, r["message_id"])
+    return {"image_id": image_id, "message_id": r["message_id"], "status": "ok"}
+
+
+def _images_for(conn: sqlite3.Connection, ids: list[int], text_chars: int | None = None) -> dict[int, list[dict]]:
+    out: dict[int, list[dict]] = {}
+    if not ids:
+        return out
+    q = ",".join("?" * len(ids))
+    for i in conn.execute(f"SELECT id, message_id, description, status, text, source, note FROM zalo_images "
+                          f"WHERE message_id IN ({q}) ORDER BY id", ids):
+        d = dict(i)
+        mid = d.pop("message_id")
+        if text_chars is not None and d["text"] and len(d["text"]) > text_chars:
+            d["text"] = d["text"][:text_chars] + "…"
+        out.setdefault(mid, []).append({k: v for k, v in d.items() if v is not None})
+    return out
+
+
 def save_messages(conversation: str, messages: list[dict], last_message: dict | None = None) -> dict:
-    """Lưu các tin có thông tin công việc + cập nhật mốc đã đọc. Tin trùng (cùng msg_key) được bỏ qua."""
+    """Lưu các tin có thông tin công việc + cập nhật mốc đã đọc. Tin trùng (cùng msg_key) được bỏ qua
+    (ảnh mới kèm tin trùng vẫn được thêm)."""
+    from . import ocr
+
     cats = {c["code"] for c in db.categories()}
     now = _iso(_now_dt())
     inserted, duplicate, errors = [], 0, []
+    if sum(len(m.get("images") or []) for m in messages) > MAX_IMAGES_PER_CALL:
+        raise ValueError(f"Tối đa {MAX_IMAGES_PER_CALL} ảnh mỗi lần lưu — chia thành nhiều lần")
+    ocr_on = ocr.enabled()
+    fetch: list[tuple[int, str]] = []
+    to_read: list[dict] = []
+    counts = dict.fromkeys(("queued_ocr", "read_by_claude", "described", "not_downloaded", "duplicate"), 0)
     with connect() as conn:
         row = _find_conv(conn, conversation)
         if row is None:
@@ -316,9 +490,14 @@ def save_messages(conversation: str, messages: list[dict], last_message: dict | 
                      int(bool(m.get("important"))), now))
                 if cur.rowcount == 0:
                     duplicate += 1
+                    mid = conn.execute("SELECT id FROM zalo_messages WHERE msg_key=?", (key,)).fetchone()[0]
                 else:
-                    _index(conn, cur.lastrowid)
-                    inserted.append(cur.lastrowid)
+                    mid = cur.lastrowid
+                    inserted.append(mid)
+                if m.get("images"):
+                    _add_images(conn, mid, m["images"], now, ocr_on, fetch, to_read, counts)
+                if cur.rowcount or m.get("images"):
+                    _index(conn, mid)
             except ValueError as e:
                 errors.append({"index": i, "error": str(e)})
         sets: dict[str, Any] = {"last_scanned_at": now}
@@ -331,8 +510,17 @@ def save_messages(conversation: str, messages: list[dict], last_message: dict | 
                 + nfc(last_message.get("text"))[:150])
         conn.execute(f"UPDATE zalo_conversations SET {', '.join(k + '=?' for k in sets)} WHERE id=?",
                      [*sets.values(), cid])
-    return {"conversation": row["name"], "inserted": len(inserted), "duplicate": duplicate, "errors": errors,
-            "ids": inserted}
+    _fetch_images(fetch, to_read, counts)
+    out: dict[str, Any] = {"conversation": row["name"], "inserted": len(inserted), "duplicate": duplicate,
+                           "errors": errors, "ids": inserted}
+    if any(counts.values()):
+        out["images"] = counts
+    if to_read:
+        out["images_to_read"] = to_read
+        out["next_step"] = ("Máy chủ không đọc được các ảnh trong images_to_read: mở ảnh trên Zalo (bấm để xem lớn), "
+                            "đọc chữ / số liệu chính rồi gọi save_zalo_image_text (tối đa ~10 ảnh mỗi lượt, ưu "
+                            "tiên ảnh quan trọng).")
+    return out
 
 
 def delete_messages(ids: list[int]) -> int:
@@ -525,7 +713,10 @@ def search(query: str, conversation: str | None = None, sender: str | None = Non
             rows = conn.execute(
                 _SELECT.split(" FROM ")[0] + ", bm25(zalo_messages_fts, 1.0, 3.0, 2.0) AS score" + base
                 + f" ORDER BY {order} LIMIT ?", [*params, max(1, min(limit, 100))]).fetchall()
+            imgs.update(_images_for(conn, [r["id"] for r in rows]))
         return total, rows
+
+    imgs: dict[int, list[dict]] = {}
 
     terms = [db.fts_term(t) for t in tokens]
     mode = "all_words"
@@ -537,7 +728,11 @@ def search(query: str, conversation: str | None = None, sender: str | None = Non
     for r in rows:
         d = _out(r)
         d.pop("score", None)
-        d["text"] = db._snippet(d["text"] or "", tokens)
+        mi = imgs.get(d["id"], [])
+        img_text = "\n".join(f"[Ảnh: {i.get('description') or 'ảnh'}] {i.get('text') or ''}".strip() for i in mi)
+        d["text"] = db._snippet("\n".join(filter(None, [d["text"], img_text])), tokens)
+        if mi:
+            d["images"] = [{k: v for k, v in i.items() if k != "text"} for i in mi]
         results.append(d)
     return {"query": query, "match_mode": mode, "total_matching": total, "count": len(results), "results": results}
 
@@ -557,8 +752,14 @@ def messages(conversation: str | None = None, sender: str | None = None, date_fr
         rows = conn.execute(
             _SELECT + w + f" ORDER BY m.sent_at {'DESC' if order == 'newest' else 'ASC'} LIMIT ? OFFSET ?",
             [*params, max(1, min(limit, 500)), max(0, offset)]).fetchall()
-    return {"total": total, "offset": offset, "count": len(rows),
-            "messages": [_out(r, max_chars_each) for r in rows]}
+        imgs = _images_for(conn, [r["id"] for r in rows], max_chars_each)
+    out = []
+    for r in rows:
+        d = _out(r, max_chars_each)
+        if r["id"] in imgs:
+            d["images"] = imgs[r["id"]]
+        out.append(d)
+    return {"total": total, "offset": offset, "count": len(rows), "messages": out}
 
 
 def digest(date_from: str | None = None, date_to: str | None = None, conversation: str | None = None,
