@@ -262,6 +262,7 @@ async def overview(_: Request) -> Any:
 
         cp = db.checkpoint()
         return {"today": db.today(), **db.overview(), "latest_sent_at": cp["latest_sent_at"], "ocr": ocr.status(),
+                "zalo": zalo.summary(),
                 "recent_imports": cp["recent_imports"], "sources": db.sources(),
                 "category_list": db.categories()}
     return await _run(work)

@@ -52,7 +52,7 @@ def run() -> None:
     anon = httpx.Client(base_url=BASE, timeout=10)
     print("Giao diện & xác thực")
     r = anon.get("/")
-    check(r.status_code == 200 and "Quản lý email công việc" in r.text, "GET / trả trang giao diện (công khai)")
+    check(r.status_code == 200 and "Trợ lý TLC" in r.text, "GET / trả trang giao diện (công khai)")
     check("frame-ancestors 'none'" in r.headers.get("content-security-policy", ""), "có header CSP")
     check(anon.get("/assets/app.js").status_code == 200, "GET /assets/app.js")
     check(anon.get("/assets/server.py").status_code == 404 and anon.get("/assets/../server.py").status_code in (401, 404), "không đọc được file ngoài danh sách asset")

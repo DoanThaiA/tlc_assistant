@@ -79,6 +79,11 @@ function fmtDateTime(iso) {
   return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 const WEEKDAYS = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"];
+const WEEKDAYS_LONG = ["Chủ nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"];
+function longDate(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return `${WEEKDAYS_LONG[d.getDay()]}, ${fmtDate(iso)}`;
+}
 function addDays(iso, n) {
   const d = new Date(iso + "T00:00:00");
   d.setDate(d.getDate() + n);
@@ -117,7 +122,21 @@ function setPendingBadge(n) {
   b.textContent = n > 999 ? "999+" : String(n || "");
   b.hidden = !n;
 }
-const catLabel = (code) => (code ? code.replace(/_/g, " ") : "chưa phân loại");
+const CAT_SHORT = {
+  bao_cao_ngay: "Báo cáo ngày", giao_viec: "Giao việc", khach_hang: "Khách hàng", du_an: "Dự án",
+  tai_chinh: "Tài chính", nhan_su: "Nhân sự", hop_lich: "Họp & lịch", thi_truong: "Thị trường",
+  he_thong: "Hệ thống", khac: "Khác",
+};
+/** Nhãn ngắn của nhóm phân loại: tên quen thuộc, hoặc phần đầu của mô tả, hoặc mã. */
+function catLabel(code) {
+  if (!code || code.startsWith("(")) return "Chưa phân loại";
+  if (CAT_SHORT[code]) return CAT_SHORT[code];
+  const c = (state.cats || []).find((x) => x.code === code);
+  const head = c && c.name ? c.name.split(/[,:;(—–]| - /)[0].trim() : "";
+  if (head && head.length <= 22) return head;
+  const t = code.replace(/_/g, " ");
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
 function catName(code) {
   const c = state.cats.find((x) => x.code === code);
   return c ? c.name : catLabel(code);
@@ -207,10 +226,26 @@ const views = {
   rules: viewRules, imports: viewImports, replies: viewReplies, zalo: viewZalo,
 };
 
+function setNav(open) {
+  $("#app").classList.toggle("nav-open", open);
+  $("#menu-btn").setAttribute("aria-expanded", open ? "true" : "false");
+}
+$("#menu-btn").addEventListener("click", () => setNav(!$("#app").classList.contains("nav-open")));
+$("#scrim").addEventListener("click", () => setNav(false));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") setNav(false); });
+
 function route() {
   const name = (location.hash.match(/^#\/(\w+)/) || [])[1] || "overview";
   const fn = views[name] || viewOverview;
-  for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("active", a.dataset.view === name);
+  setNav(false);
+  for (const a of document.querySelectorAll("#tabs a")) {
+    const on = a.dataset.view === name;
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  }
+  const label = document.querySelector(`#tabs a[data-view="${views[name] ? name : "overview"}"] span`);
+  document.title = `${label ? label.textContent : "Tổng quan"} · Trợ lý TLC`;
+  window.scrollTo(0, 0);
   const root = $("#view");
   root.replaceChildren();
   fn(root).catch(fail);
@@ -228,6 +263,7 @@ async function boot() {
   }
   $("#login").hidden = true;
   $("#app").hidden = false;
+  $("#today-label").textContent = `Hôm nay ${fmtDate(state.me.today)}`;
   try { await loadMeta(); } catch (e) { fail(e); }
   route();
 }
@@ -237,107 +273,183 @@ async function boot() {
 /* ------------------------------------------------------------------ */
 async function viewOverview(root) {
   const today = state.me.today;
-  const [ov, st] = await Promise.all([
+  const [ov, st, todaySubs] = await Promise.all([
     loadMeta(),
     api("GET", "/api/stats" + qs({ date_from: addDays(today, -13), date_to: today })),
+    api("GET", "/api/submissions" + qs({ date: today })),
   ]);
   const lastImport = ov.recent_imports && ov.recent_imports[0];
-
-  const card = (label, value, sub) =>
-    h("div", { class: "panel panel-pad card" },
-      h("div", { class: "label" }, label), h("div", { class: "value" + (String(value).length > 8 ? " sm" : "") }, value), sub ? h("div", { class: "sub" }, sub) : null);
-
-  const subsBox = h("div", { class: "panel panel-pad" });
-  const dateInput = h("input", { type: "date", value: today, max: today, class: "nowrap", onchange: () => loadSubs(dateInput.value) });
-
-  async function loadSubs(day) {
-    subsBox.replaceChildren(h("div", { class: "muted" }, "Đang tải…"));
-    const s = await api("GET", "/api/submissions" + qs({ date: day }));
-    const head = h("div", { class: "page-head" },
-      h("h2", {}, "Tình hình nộp báo cáo"),
-      h("div", { class: "actions" }, dateInput));
-    const summary = h("p", { class: "muted" },
-      `${s.submitted_count}/${s.employees_active} nhân viên đã nộp · ${s.total_reports} báo cáo`,
-      s.is_work_day ? "" : " · không phải ngày làm việc");
-
-    const person = (p, badge, extra) => h("li", {},
-      h("div", { class: "who" }, h("div", {}, p.name || p.email), h("div", {}, [p.department, p.email].filter(Boolean).join(" · "))),
-      h("div", { class: "nowrap" }, extra || null, badge));
-
-    const submitted = h("ul", { class: "people" }, s.submitted.map((p) =>
-      person(p, h("span", { class: "badge ok" }, p.first_sent_at ? fmtDateTime(p.first_sent_at).slice(11) : "Đã nộp"))));
-    const missing = h("ul", { class: "people" }, s.missing.map((p) => person(p, h("span", { class: "badge danger" }, "Chưa nộp"))));
-    const unknown = h("ul", { class: "people" }, s.senders_not_in_employee_list.map((p) =>
-      person(p, h("span", { class: "badge warn" }, `${p.report_ids.length} báo cáo`),
-        h("button", { class: "btn sm", type: "button", onclick: () => employeeForm({ email: p.email, name: p.name || "" }, () => loadSubs(day)) }, "+ Thêm NV"))));
-
-    subsBox.replaceChildren(head, summary,
-      h("div", { class: "grid two-col" },
-        h("div", {}, h("h2", {}, `Chưa nộp (${s.missing_count})`),
-          s.missing.length ? missing : h("p", { class: "muted" }, s.employees_active ? "Tất cả đã nộp 🎉" : "Chưa có danh sách nhân viên.")),
-        h("div", {}, h("h2", {}, `Đã nộp (${s.submitted_count})`),
-          s.submitted.length ? submitted : h("p", { class: "muted" }, "Chưa có ai."))),
-      s.senders_not_in_employee_list.length
-        ? h("div", {}, h("h2", { class: "mt" }, "Người gửi chưa có trong danh sách nhân viên"), unknown)
-        : null);
-  }
-
-  // Biểu đồ 14 ngày
+  const zl = ov.zalo || {};
+  const ocr = ov.ocr || {};
   const perDay = Object.fromEntries(st.per_day.map((d) => [d.report_date, d.reports]));
+
+  const icon = (paths) => {
+    const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    s.setAttribute("viewBox", "0 0 24 24");
+    s.setAttribute("aria-hidden", "true");
+    for (const d of paths) {
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", d);
+      s.append(p);
+    }
+    return s;
+  };
+  const ICONS = {
+    inbox: ["M22 12h-6l-2 3h-4l-2-3H2", "M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"],
+    check: ["M20 6 9 17l-5-5"],
+    mail: ["M2 6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z", "m22 7-10 6L2 7"],
+    chat: ["M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.5A8 8 0 1 1 21 12z"],
+  };
+  const card = ({ label, value, sub, icon: ic, tone = "", meter, href }) => {
+    const c = h("div", { class: "panel panel-pad card" },
+      ic ? h("span", { class: "icon-chip " + tone }, icon(ICONS[ic])) : null,
+      h("div", { class: "label" }, label),
+      h("div", { class: "value" }, value),
+      meter != null ? (() => { const m = h("div", { class: "meter " + tone }, h("span")); m.firstChild.style.width = `${Math.round(meter * 100)}%`; return m; })() : null,
+      sub ? h("div", { class: "sub" }, sub) : null);
+    return href ? h("a", { href, class: "card-link" }, c) : c;
+  };
+
+  // ----- Thẻ số liệu -----
+  const active = todaySubs.employees_active || 0;
+  const submitted = todaySubs.submitted_count || 0;
+  const todayCount = perDay[today] || 0;
+  const subsValue = active ? h("span", {}, String(submitted), h("small", {}, ` / ${active}`)) : "—";
+  const cards = h("div", { class: "grid cards four" },
+    card({ label: "Chờ duyệt", value: ov.pending ?? 0, icon: "inbox", tone: ov.pending ? "warn" : "ok", href: "#/pending",
+      sub: ov.pending ? "Claude lọc ở lượt định kỳ kế tiếp" : "Đã duyệt hết" }),
+    card({ label: "Nộp báo cáo hôm nay", value: subsValue, icon: "check",
+      tone: !active ? "" : submitted >= active ? "ok" : "warn", meter: active ? submitted / active : null,
+      sub: !active ? "Chưa có danh sách nhân viên" : todaySubs.missing_count ? `${todaySubs.missing_count} người chưa nộp` : "Tất cả đã nộp",
+      href: "#/overview-subs" }),
+    card({ label: "Email đã lưu", value: (ov.total_reports ?? 0).toLocaleString("vi-VN"), icon: "mail", href: "#/reports",
+      sub: todayCount ? `+${todayCount} hôm nay · ${(ov.by_status && ov.by_status.discarded) || 0} đã loại`
+        : `${(ov.by_status && ov.by_status.discarded) || 0} email đã loại` }),
+    card({ label: "Trợ lý trả lời hôm nay", value: zl.replies_sent_today ?? 0, icon: "chat", href: "#/replies",
+      sub: `${zl.reply_conversations ?? 0} hội thoại được trả lời · ${zl.watched_conversations ?? 0} đang theo dõi` }));
+  cards.querySelector('a[href="#/overview-subs"]').addEventListener("click", (e) => {
+    e.preventDefault();
+    subsBox.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+
+  // ----- Biểu đồ 14 ngày -----
   const days = Array.from({ length: 14 }, (_, i) => addDays(today, i - 13));
   const max = Math.max(1, ...days.map((d) => perDay[d] || 0));
+  const total14 = days.reduce((s, d) => s + (perDay[d] || 0), 0);
   const bars = h("div", { class: "bars" }, days.map((d) => {
     const n = perDay[d] || 0;
-    const fill = h("div", { class: "fill" + (n ? "" : " zero"), title: `${fmtDate(d)}: ${n} báo cáo` });
+    const fill = h("div", { class: "fill" + (n ? "" : " zero"), title: `${fmtDate(d)}: ${n} email` });
     fill.style.height = `${Math.max(2, (n / max) * 100)}%`;
     const wd = WEEKDAYS[new Date(d + "T00:00:00").getDay()];
-    return h("div", { class: "bar" }, h("span", { class: "n" }, n || ""), fill, h("span", { class: "d" }, h("span", { class: "wd" }, wd + " "), d.slice(8)));
+    return h("div", { class: "bar" }, h("span", { class: "n" }, n || ""), fill,
+      h("span", { class: "d" }, h("span", { class: "wd" }, wd + " "), d.slice(8)));
   }));
 
+  // ----- Theo nhóm -----
+  const cats = (ov.categories || []).slice(0, 8);
+  const catMax = Math.max(1, ...cats.map((c) => c.count));
+  const catList = cats.length
+    ? h("ul", { class: "cat-list" }, cats.map((c) => {
+      const mini = h("div", { class: "mini" }, h("span"));
+      mini.firstChild.style.width = `${(c.count / catMax) * 100}%`;
+      return h("li", {},
+        h("div", { class: "bar-cell" },
+          h("a", { href: "#/reports", title: c.name, onclick: () => Object.assign(reportFilter, {
+            category: c.code.startsWith("(") ? "" : c.code, status: "kept", offset: 0 }) }, catLabel(c.code)),
+          mini),
+        h("span", { class: "badge" }, c.count));
+    }))
+    : h("p", { class: "muted" }, "Chưa có email nào được lưu.");
+
+  // ----- Tình hình nộp báo cáo -----
+  const subsBox = h("div", { class: "panel panel-pad", id: "subs" });
+  const dateInput = h("input", { type: "date", value: today, max: today, onchange: () => loadSubs(dateInput.value) });
+  dateInput.style.width = "auto";
+  const initials = (name) => (name || "?").trim().split(/\s+/).slice(-2).map((w) => w[0]).join("").toUpperCase();
+
+  async function loadSubs(day) {
+    const s = day === today ? todaySubs : await api("GET", "/api/submissions" + qs({ date: day }));
+    const person = (p, badge, extra) => h("li", {},
+      h("div", { class: "row-left" }, h("span", { class: "avatar" }, initials(p.name || p.email)),
+        h("div", { class: "who" }, h("div", {}, p.name || p.email), h("div", {}, [p.department, p.email].filter(Boolean).join(" · ")))),
+      h("div", { class: "nowrap" }, extra || null, badge));
+    subsBox.replaceChildren(...[
+      h("div", { class: "page-head" },
+        h("div", {}, h("h2", {}, "Tình hình nộp báo cáo"),
+          h("div", { class: "muted small" }, `${s.submitted_count}/${s.employees_active} nhân viên đã nộp · ${s.total_reports} báo cáo`,
+            s.is_work_day ? "" : " · không phải ngày làm việc")),
+        h("div", { class: "actions" }, dateInput)),
+      h("div", { class: "grid two-col" },
+        h("div", {}, h("h2", {}, `Chưa nộp (${s.missing_count})`),
+          s.missing.length ? h("ul", { class: "people" }, s.missing.map((p) => person(p, h("span", { class: "badge danger" }, "Chưa nộp"))))
+            : h("p", { class: "muted" }, s.employees_active ? "Tất cả đã nộp 🎉" : "Chưa có danh sách nhân viên.")),
+        h("div", {}, h("h2", {}, `Đã nộp (${s.submitted_count})`),
+          s.submitted.length ? h("ul", { class: "people" }, s.submitted.map((p) =>
+            person(p, h("span", { class: "badge ok" }, p.first_sent_at ? fmtDateTime(p.first_sent_at).slice(11) : "Đã nộp"))))
+            : h("p", { class: "muted" }, "Chưa có ai."))),
+      s.senders_not_in_employee_list.length
+        ? h("div", {}, h("h2", { class: "mt" }, "Người gửi báo cáo chưa có trong danh sách nhân viên"),
+          h("ul", { class: "people" }, s.senders_not_in_employee_list.map((p) =>
+            person(p, h("span", { class: "badge warn" }, `${p.report_ids.length} báo cáo`),
+              h("button", { class: "btn sm", type: "button", onclick: () => employeeForm({ email: p.email, name: p.name || "" }, () => loadSubs(day)) }, "+ Thêm NV")))))
+        : null].filter(Boolean));
+  }
+
+  // ----- Tình trạng hệ thống -----
+  const hoursAgo = (iso) => (iso ? (Date.now() - new Date(iso).getTime()) / 36e5 : Infinity);
+  const ago = (iso) => {
+    if (!iso) return "chưa có";
+    const m = Math.round((Date.now() - new Date(iso).getTime()) / 6e4);
+    if (m < 1) return "vừa xong";
+    if (m < 60) return `${m} phút trước`;
+    if (m < 60 * 24) return `${Math.round(m / 60)} giờ trước`;
+    return fmtDateTime(iso);
+  };
+  const stRow = (tone, title, sub) => h("li", {}, h("span", { class: "st-dot " + tone }),
+    h("div", {}, h("div", { class: "st-title" }, title), h("div", { class: "st-sub" }, sub)));
+  const sysList = h("ul", { class: "status-list" },
+    stRow(!lastImport ? "danger" : hoursAgo(lastImport.at) > 24 ? "warn" : "ok", "Lấy mail từ Gmail (Apps Script)",
+      lastImport ? `Lần gần nhất ${ago(lastImport.at)}: +${lastImport.inserted} mới, ${lastImport.duplicate} trùng, ${lastImport.failed} lỗi`
+        : "Chưa nhận được lần nào — kiểm tra Apps Script"),
+    stRow(ov.pending ? "warn" : "ok", "Lọc email (Claude)",
+      ov.pending ? `${ov.pending} email chờ lọc` : "Không còn email chờ lọc"),
+    stRow(!zl.watched_conversations ? "" : hoursAgo(zl.last_scanned_at) > 2 ? "warn" : "ok", "Quét Zalo",
+      zl.watched_conversations ? `Lần quét gần nhất: ${ago(zl.last_scanned_at)} · ${zl.today ?? 0} tin công việc hôm nay`
+        : "Chưa theo dõi hội thoại nào"),
+    stRow(!ocr.enabled ? "" : ocr.paused ? "danger" : ocr.queued ? "warn" : "ok", "OCR file scan / ảnh",
+      !ocr.enabled ? "Đang tắt — đặt OCR_SPACE_API_KEY trong .env để bật"
+        : `${ocr.queued ? `${ocr.queued} file đang chờ` : "Không có file chờ"} · ${ocr.used_today}/${ocr.daily_limit} lượt hôm nay`
+          + (ocr.paused ? " · tạm dừng (OCR.space từ chối)" : "")));
+
   const mcpUrl = location.origin + (state.me.mcp_path || "/mcp");
-  const urlInput = h("input", { value: mcpUrl, readOnly: true, onfocus: (e) => e.target.select() });
+  const urlInput = h("input", { value: mcpUrl + "?key=<API key>", readOnly: true, onfocus: (e) => e.target.select() });
 
   root.append(
-    h("div", { class: "page-head" }, h("h1", {}, "Tổng quan"),
-      h("div", { class: "muted" }, `Hôm nay ${fmtDate(today)} · ${state.me.timezone}`)),
-    h("div", { class: "grid cards" },
-      h("a", { href: "#/pending", class: "card-link" },
-        card("Chờ duyệt", ov.pending ?? 0, ov.pending ? "Claude sẽ lọc ở lượt chạy tới" : "Đã duyệt hết")),
-      card("Email đã lưu", ov.total_reports ?? 0, ov.first_date ? `${fmtDate(ov.first_date)} → ${fmtDate(ov.last_date)}` : "Chưa có dữ liệu"),
-      card("Đã loại bỏ", (ov.by_status && ov.by_status.discarded) ?? 0, `${ov.senders ?? 0} người gửi đã lưu`),
-      card("Nhân viên theo dõi", ov.active_employees ?? 0, null)),
-    h("div", { class: "grid two-col" },
-      h("div", { class: "panel panel-pad" }, h("h2", {}, "Email đã lưu 14 ngày gần đây"), bars),
-      h("div", { class: "panel panel-pad" }, h("h2", {}, "Theo nhóm"),
-        ov.categories && ov.categories.length
-          ? h("ul", { class: "cat-list" }, ov.categories.map((c) => h("li", {},
-            h("a", { href: "#/reports", title: c.name, onclick: () => Object.assign(reportFilter, {
-              category: c.code.startsWith("(") ? "" : c.code, status: "kept", offset: 0 }) }, catLabel(c.code)),
-            h("span", { class: "badge" }, c.count))))
-          : h("p", { class: "muted" }, "Chưa có email nào được lưu."))),
+    h("div", { class: "page-head" },
+      h("div", {}, h("h1", {}, "Tổng quan"),
+        h("p", { class: "page-sub" }, `${longDate(today)} · ${state.me.timezone}`))),
+    cards,
+    h("div", { class: "grid three-col" },
+      h("div", { class: "panel panel-pad" },
+        h("div", { class: "page-head" }, h("h2", {}, "Email đã lưu 14 ngày gần đây"), h("span", { class: "muted small" }, `${total14} email`)),
+        bars),
+      h("div", { class: "panel panel-pad" },
+        h("div", { class: "page-head" }, h("h2", {}, "Theo nhóm"), h("a", { href: "#/reports", class: "small" }, "Xem tất cả")),
+        catList)),
     h("div", { class: "spacer" }),
     subsBox,
     h("div", { class: "spacer" }),
     h("div", { class: "grid two-col" },
-      h("div", { class: "panel panel-pad" },
-        h("h2", {}, "Luồng hoạt động"),
-        h("div", { class: "flow" }, h("span", { class: "step" }, "Gmail"), "→", h("span", { class: "step" }, "Apps Script"), "→",
-          h("span", { class: "step" }, "Chờ duyệt"), "→", h("span", { class: "step" }, "Claude lọc"), "→",
-          h("span", { class: "step" }, "Đã lưu / Đã loại")),
-        h("p", { class: "muted small" },
-          lastImport ? `Lần nhập gần nhất ${fmtDateTime(lastImport.at)}: +${lastImport.inserted} mới, ${lastImport.duplicate} trùng, ${lastImport.failed} lỗi. `
-            : "Chưa có lần nhập nào. ",
-          ov.latest_sent_at ? `Email mới nhất gửi lúc ${fmtDateTime(ov.latest_sent_at)}.` : ""),
-        ov.ocr ? h("p", { class: "muted small" },
-          ov.ocr.enabled
-            ? `OCR file scan / ảnh: ${ov.ocr.queued ? `${ov.ocr.queued} file đang chờ` : "không có file chờ"} · đã dùng ${ov.ocr.used_today}/${ov.ocr.daily_limit} lượt hôm nay${ov.ocr.paused ? " · đang tạm dừng (OCR.space từ chối, thử lại sau 1 giờ)" : ""}.`
-            : "OCR đang tắt — ảnh và PDF scan đính kèm chỉ lưu tên file (đặt OCR_SPACE_API_KEY trong .env để bật).") : null),
+      h("div", { class: "panel panel-pad" }, h("h2", {}, "Tình trạng hệ thống"), sysList),
       h("div", { class: "panel panel-pad" },
         h("h2", {}, "Kết nối Claude (MCP)"),
-        h("p", { class: "muted" }, "Dùng URL này khi thêm Custom connector trên claude.ai / Claude Desktop, nối thêm ?key=<API key>."),
+        h("div", { class: "flow" }, h("span", { class: "step" }, "Gmail"), "→", h("span", { class: "step" }, "Apps Script"), "→",
+          h("span", { class: "step" }, "Chờ duyệt"), "→", h("span", { class: "step" }, "Claude lọc"), "→",
+          h("span", { class: "step" }, "Hỏi đáp trên Claude / Zalo")),
+        h("p", { class: "muted small" }, "Dùng URL này khi thêm Custom connector trên claude.ai / Claude Desktop (thay <API key> bằng key thật)."),
         h("div", { class: "copy-row" }, urlInput,
           h("button", { class: "btn", type: "button", onclick: async () => {
-            try { await navigator.clipboard.writeText(mcpUrl); toast("Đã sao chép"); } catch { urlInput.select(); }
+            try { await navigator.clipboard.writeText(mcpUrl + "?key="); toast("Đã sao chép — dán API key vào cuối"); } catch { urlInput.select(); }
           } }, "Sao chép")))),
   );
   await loadSubs(today);
@@ -737,7 +849,7 @@ async function viewPending(root) {
     h("div", { class: "page-head" }, h("h1", {}, "Chờ duyệt"),
       h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => load() }, "Tải lại"))),
     h("p", { class: "muted" },
-      "Email do Apps Script lấy từ Gmail. Claude Desktop (tác vụ định kỳ, prompt “loc_email_moi”) sẽ tự giữ email công việc và loại email không liên quan theo ",
+      "Email do Apps Script lấy từ Gmail. Tác vụ định kỳ 15 phút trên Claude Desktop (prompt “tro_ly_dinh_ky”) tự giữ email công việc và loại email không liên quan theo ",
       h("a", { href: "#/rules" }, "quy tắc lọc"), ". Bạn cũng có thể duyệt tay ở đây."),
     h("div", { class: "panel" }, bulkbar, tableBox, h("div", { class: "pager" }, countEl)));
 
@@ -927,7 +1039,7 @@ async function viewReplies(root) {
     const pickAsker = (name) => (e) => { e.preventDefault(); Object.assign(f, { asker: name, offset: 0 }); route(); };
 
     statsBox.replaceChildren(
-      h("div", { class: "grid cards" },
+      h("div", { class: "grid cards four" },
         card("Câu hỏi", st.total, `${fmtDate(df)} → ${fmtDate(dt)}`),
         card("Đã trả lời", st.by_status.sent, st.total ? `${Math.round((st.by_status.sent / st.total) * 100)}% số câu hỏi` : null),
         card("Bỏ qua", st.by_status.skipped, st.by_status.claimed ? `${st.by_status.claimed} câu đang soạn / dở dang` : "Không có câu dở dang"),
